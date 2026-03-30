@@ -62,12 +62,13 @@ The file and its directory are created automatically with defaults if absent.
 ### All options
 
 ```toml
-# Which edge of each monitor the bar attaches to.
-# Values: "top" | "bottom" | "left" | "right"
-position = "top"
+# Which screen edge the bar docks to.
+# Values: "top" | "bottom"
+position = "bottom"
 
-# Height of the bar in logical pixels (or width when position is left/right).
-bar_size = 28
+# How far along the edge to place the bar, as a percentage of monitor width.
+# 0.0 = left-most (default), 50.0 = centred, 100.0 = right edge.
+offset_percent = 0.0
 
 # GlazeWM IPC port.
 glazewm_port = 6123
@@ -93,7 +94,8 @@ font_size = 13.0
 # Horizontal padding inside each workspace label.
 label_padding_x = 10.0
 
-# Vertical padding inside each workspace pill.
+# Vertical padding above and below the text.
+# Bar height = font cap-height + 2 × label_padding_y.
 label_padding_y = 4.0
 
 # Corner radius of the active workspace pill.
