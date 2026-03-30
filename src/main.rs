@@ -143,7 +143,7 @@ impl App {
             .with_decorations(false)
             .with_resizable(false)
             .with_transparent(true)
-            .with_window_level(WindowLevel::AlwaysOnTop)
+            .with_window_level(WindowLevel::Normal)
             .with_position(PhysicalPosition::new(win_x, win_y))
             .with_inner_size(PhysicalSize::new(content.width.max(1), content.height.max(1)));
 

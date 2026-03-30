@@ -1,10 +1,95 @@
+use std::io::Write;
+use std::path::PathBuf;
+
 fn main() {
-    // In release builds on Windows, set the PE subsystem to WINDOWS so the
-    // executable launches without a console window.  Debug builds keep the
-    // console so that `cargo run` shows output and Ctrl+C works normally.
-    #[cfg(target_os = "windows")]
+    // Only applies to Windows targets.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let ico_path = out_dir.join("glazeid.ico");
+
+    // Generate a multi-resolution .ico from the bundled PNG at build time.
+    generate_ico(&ico_path);
+
+    // Embed the icon into the PE via a Windows resource script.
+    let mut res = winres::WindowsResource::new();
+    res.set_icon(ico_path.to_str().unwrap());
+
+    // Suppress the console window in release builds only.
+    // Debug builds keep the console so `cargo run` shows output and Ctrl+C works.
     if std::env::var("PROFILE").as_deref() == Ok("release") {
         println!("cargo:rustc-link-arg=/SUBSYSTEM:WINDOWS");
         println!("cargo:rustc-link-arg=/ENTRY:mainCRTStartup");
+    }
+
+    if let Err(e) = res.compile() {
+        // Non-fatal: icon just won't appear in Task Manager.
+        eprintln!("winres failed (icon won't be embedded): {e}");
+    }
+}
+
+/// Write a minimal multi-resolution ICO file (16×16, 32×32, 256×256) to
+/// `out`, with each variant PNG-encoded and resized from `resources/glazeid.png`
+/// using Lanczos3.  Windows Vista+ supports PNG-in-ICO natively.
+fn generate_ico(out: &PathBuf) {
+    const LOGO: &[u8] = include_bytes!("resources/glazeid.png");
+    const SIZES: &[u32] = &[16, 32, 256];
+
+    let src = image::load_from_memory(LOGO)
+        .expect("valid logo PNG")
+        .into_rgba8();
+
+    let mut images: Vec<Vec<u8>> = Vec::new();
+    for &size in SIZES {
+        let resized =
+            image::imageops::resize(&src, size, size, image::imageops::FilterType::Lanczos3);
+        let mut png_bytes: Vec<u8> = Vec::new();
+        resized
+            .write_to(
+                &mut std::io::Cursor::new(&mut png_bytes),
+                image::ImageFormat::Png,
+            )
+            .expect("encode resized icon");
+        images.push(png_bytes);
+    }
+
+    write_ico(out, &images, SIZES);
+}
+
+/// Serialize PNG-encoded `images` into an ICO file at `path`.
+///
+/// ICO format: 6-byte file header, N×16-byte directory entries, then image data.
+fn write_ico(path: &PathBuf, images: &[Vec<u8>], sizes: &[u32]) {
+    let count = images.len() as u16;
+    let dir_size = 6 + count as usize * 16;
+
+    let mut offsets: Vec<u32> = Vec::new();
+    let mut offset = dir_size as u32;
+    for img in images {
+        offsets.push(offset);
+        offset += img.len() as u32;
+    }
+
+    let mut f = std::fs::File::create(path).expect("create .ico");
+
+    // File header: reserved(2) + type=1(2) + image count(2)
+    f.write_all(&[0u8, 0, 1, 0]).unwrap();
+    f.write_all(&count.to_le_bytes()).unwrap();
+
+    // ICONDIRENTRY × count
+    for (i, img) in images.iter().enumerate() {
+        let w = if sizes[i] >= 256 { 0u8 } else { sizes[i] as u8 };
+        let h = if sizes[i] >= 256 { 0u8 } else { sizes[i] as u8 };
+        f.write_all(&[w, h, 0u8, 0u8]).unwrap(); // width, height, colorCount, reserved
+        f.write_all(&1u16.to_le_bytes()).unwrap(); // planes
+        f.write_all(&32u16.to_le_bytes()).unwrap(); // bitCount
+        f.write_all(&(img.len() as u32).to_le_bytes()).unwrap(); // bytesInRes
+        f.write_all(&offsets[i].to_le_bytes()).unwrap(); // imageOffset
+    }
+
+    for img in images {
+        f.write_all(img).unwrap();
     }
 }
