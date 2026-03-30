@@ -1,8 +1,12 @@
-# glazeid
+<p align="center">
+  <img src="resources/glazeid.png" width="120" alt="glazeid logo" />
+</p>
 
-A minimal, extremely efficient workspace bar for [GlazeWM](https://github.com/glzr-io/glazewm).
+<h1 align="center">glazeid</h1>
 
-Shows the active workspace and all available workspaces. Nothing else.
+<p align="center">A minimal, extremely efficient workspace bar for <a href="https://github.com/glzr-io/glazewm">GlazeWM</a>.</p>
+
+<p align="center">Shows the active workspace and all available workspaces. Nothing else.</p>
 
 ## Features
 

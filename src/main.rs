@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 /// glazeid — a minimal GlazeWM workspace bar.
 ///
 /// One window is created per monitor.  Its size is driven entirely by content:
@@ -13,6 +15,7 @@ mod client;
 mod config;
 mod ipc;
 mod renderer;
+mod sys_tray;
 
 use std::collections::HashMap;
 use std::num::NonZeroU32;
@@ -23,7 +26,9 @@ use client::{BarState, MonitorWorkspaces, WorkspaceInfo};
 use config::{BarPosition, Config};
 use renderer::{ContentSize, Renderer};
 use softbuffer::{Context as SbContext, Surface};
+use sys_tray::Tray;
 use tokio::sync::watch;
+use tray_icon::menu::MenuEvent;
 use winit::{
     application::ApplicationHandler,
     dpi::{PhysicalPosition, PhysicalSize},
@@ -72,6 +77,8 @@ struct App {
     bars: HashMap<WindowId, BarWindow>,
     sb_ctx: Option<SbContext<Arc<Window>>>,
     dirty: bool,
+    /// Tray icon — installed once on first `resumed`, kept alive for its Drop.
+    tray: Option<Tray>,
 }
 
 impl App {
@@ -88,6 +95,7 @@ impl App {
             bars: HashMap::new(),
             sb_ctx: None,
             dirty: true,
+            tray: None,
         }
     }
 
@@ -130,7 +138,8 @@ impl App {
             content,
         );
 
-        let attrs = Window::default_attributes()
+        #[allow(unused_mut)]
+        let mut attrs = Window::default_attributes()
             .with_title("glazeid")
             .with_decorations(false)
             .with_resizable(false)
@@ -138,6 +147,14 @@ impl App {
             .with_window_level(WindowLevel::AlwaysOnTop)
             .with_position(PhysicalPosition::new(win_x, win_y))
             .with_inner_size(PhysicalSize::new(content.width.max(1), content.height.max(1)));
+
+        // On Windows: remove the taskbar button by setting the tool-window
+        // style (WS_EX_TOOLWINDOW).
+        #[cfg(target_os = "windows")]
+        {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            attrs = attrs.with_skip_taskbar(true);
+        }
 
         let window = Arc::new(event_loop.create_window(attrs)?);
 
@@ -266,6 +283,12 @@ impl ApplicationHandler<StateChanged> for App {
             self.create_windows(event_loop);
             self.dirty = true;
         }
+        if self.tray.is_none() {
+            match Tray::new() {
+                Ok(t) => self.tray = Some(t),
+                Err(e) => tracing::warn!("Failed to create tray icon: {e:#}"),
+            }
+        }
     }
 
     fn window_event(
@@ -306,7 +329,17 @@ impl ApplicationHandler<StateChanged> for App {
         self.redraw_all();
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Poll tray menu events — tray-icon posts them to a channel that must
+        // be drained on the main thread.
+        if let Some(tray) = &self.tray {
+            while let Ok(event) = MenuEvent::receiver().try_recv() {
+                if event.id == tray.quit_id {
+                    event_loop.exit();
+                }
+            }
+        }
+
         if self.dirty {
             self.redraw_all();
         }
