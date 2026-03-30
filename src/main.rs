@@ -1,4 +1,3 @@
-#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 /// glazeid — a minimal GlazeWM workspace bar.
 ///

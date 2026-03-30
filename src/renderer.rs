@@ -191,6 +191,20 @@ impl Renderer {
 
             cursor_x += pill_w;
         }
+
+        // Drop the pixmap borrow before we touch `buffer` again as u32.
+        drop(pixmap);
+
+        // tiny_skia writes premultiplied RGBA bytes [R, G, B, A] into memory,
+        // which on little-endian reads as u32 = 0xAABBGGRR.
+        // softbuffer requires u32 = 0x00RRGGBB.
+        // So: zero the high byte (alpha), swap R and B.
+        for pixel in buffer.iter_mut() {
+            let r = (*pixel) & 0xFF; // R is in low byte (tiny_skia byte[0])
+            let g = (*pixel >> 8) & 0xFF; // G is byte[1]
+            let b = (*pixel >> 16) & 0xFF; // B is byte[2]
+            *pixel = (r << 16) | (g << 8) | b;
+        }
     }
 }
 
