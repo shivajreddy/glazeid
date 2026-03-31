@@ -15,6 +15,7 @@
 - Connects to GlazeWM over WebSocket and reacts to workspace events in real time
 - Reconnects automatically if GlazeWM restarts
 - Pure Rust — no WebView, no JS runtime, no system font dependency
+- Transparent window background support on both Windows and macOS
 - ~3 MB release binary (LTO + stripped)
 
 ## Requirements
@@ -24,16 +25,14 @@
 
 ## Installation
 
-### From source
+```sh
+cargo install glazeid
+```
+
+Or from source:
 
 ```sh
 cargo install --path .
-```
-
-### From crates.io (once published)
-
-```sh
-cargo install glazeid
 ```
 
 ## Usage
@@ -44,7 +43,7 @@ Start glazeid after GlazeWM is running:
 glazeid
 ```
 
-glazeid will connect to GlazeWM on `127.0.0.1:6123` and create a bar on each monitor. It reconnects automatically if the connection drops.
+glazeid connects to GlazeWM on `127.0.0.1:6123` and creates a bar on each monitor. It reconnects automatically if the connection drops.
 
 Set `RUST_LOG=debug` for verbose output:
 
@@ -58,62 +57,65 @@ glazeid looks for a config file at:
 
 | Platform | Path |
 |----------|------|
-| Windows  | `%APPDATA%\glazeid\config.toml` |
-| macOS    | `~/Library/Application Support/glazeid/config.toml` |
+| macOS    | `~/.config/.glzr/glazeid/config.yaml` |
+| Windows  | `%USERPROFILE%\.glzr\glazeid\config.yaml` |
 
-The file and its directory are created automatically with defaults if absent.
+If the file does not exist, glazeid starts with the built-in defaults. No error is thrown for a missing file — only for a file that exists but cannot be parsed.
+
+A ready-to-use sample config with all options and their defaults is provided at [`resources/config.sample.yaml`](resources/config.sample.yaml). Copy it to the path above and edit as needed.
 
 ### All options
 
-```toml
+```yaml
 # Which screen edge the bar docks to.
 # Values: "top" | "bottom"
-position = "bottom"
+position: "bottom"
 
 # How far along the edge to place the bar, as a percentage of monitor width.
 # 0.0 = left-most (default), 50.0 = centred, 100.0 = right edge.
-offset_percent = 0.0
+offset_percent: 0.0
 
-# GlazeWM IPC port.
-glazewm_port = 6123
+# GlazeWM WebSocket IPC port.
+glazewm_port: 6123
 
-# Milliseconds to wait before retrying a failed connection.
-reconnect_delay_ms = 2000
+# Milliseconds to wait before retrying a failed IPC connection.
+reconnect_delay_ms: 2000
 
-# Bar background color.
-background = "#1e1e2e"
+# Bar background color. Use "#rrggbbaa" for transparency, e.g. "#00000000" = fully transparent.
+background: "#00000000"
 
-# Text color for inactive workspaces.
-foreground = "#cdd6f4"
+# Text color for inactive workspace labels.
+foreground: "#ffffff"
 
 # Fill color of the active workspace pill.
-active_bg = "#89b4fa"
+active_bg: "#DA3B01"
 
 # Text color on the active workspace pill.
-active_fg = "#1e1e2e"
+active_fg: "#000000"
 
 # Font size in logical pixels.
-font_size = 13.0
+font_size: 13.0
 
-# Horizontal padding inside each workspace label.
-label_padding_x = 10.0
+# Horizontal padding inside each workspace label, in logical pixels.
+label_padding_x: 10.0
 
-# Vertical padding above and below the text.
-# Bar height = font cap-height + 2 × label_padding_y.
-label_padding_y = 4.0
+# Vertical padding above and below the text, in logical pixels.
+# Total bar height = font cap-height + 2 × label_padding_y.
+label_padding_y: 4.0
 
-# Corner radius of the active workspace pill.
-pill_radius = 4.0
+# Corner radius of the active workspace pill, in logical pixels.
+pill_radius: 4.0
 ```
 
-Colors are specified as hex strings: `"#rrggbb"` or `"#rrggbbaa"`.
+Colors are hex strings: `"#rrggbb"` (fully opaque) or `"#rrggbbaa"` (with alpha).
 
 ## How it works
 
 | Layer | Technology |
 |-------|------------|
 | OS window | `winit` — one decoration-free, always-on-top window per monitor |
-| Pixel buffer | `softbuffer` — CPU-mapped framebuffer, no GPU required |
+| Rendering (Windows) | `softbuffer` — CPU framebuffer, no GPU required |
+| Rendering (macOS) | Custom `CGImage` surface with premultiplied alpha for true transparency |
 | Drawing | `tiny_skia` — fills background, draws rounded-rect pills |
 | Text | `fontdue` — rasterizes the embedded JetBrains Mono TTF |
 | IPC | `tokio-tungstenite` — WebSocket client to GlazeWM on port 6123 |

@@ -1,0 +1,48 @@
+# glazeid sample configuration
+#
+# Copy this file to the platform-appropriate path and edit as needed:
+#
+#   macOS:   ~/.config/.glzr/glazeid/config.yaml
+#   Windows: %USERPROFILE%\.glzr\glazeid\config.yaml
+#
+# All values shown below are the defaults. You only need to include
+# the keys you want to override — omitted keys fall back to these defaults.
+
+# Which screen edge the bar docks to.
+# Values: "top" | "bottom"
+position: "bottom"
+
+# How far along the edge to place the bar, as a percentage of monitor width.
+# 0.0 = left-most (default), 50.0 = centred, 100.0 = right edge.
+offset_percent: 0.0
+
+# GlazeWM WebSocket IPC port.
+glazewm_port: 6123
+
+# Milliseconds to wait before retrying a failed IPC connection.
+reconnect_delay_ms: 2000
+
+# Bar background color. Use "#rrggbbaa" for transparency, e.g. "#00000000" = fully transparent.
+background: "#00000000"
+
+# Text color for inactive workspace labels.
+foreground: "#ffffff"
+
+# Fill color of the active workspace pill.
+active_bg: "#DA3B01"
+
+# Text color on the active workspace pill.
+active_fg: "#000000"
+
+# Font size in logical pixels.
+font_size: 13.0
+
+# Horizontal padding inside each workspace label, in logical pixels.
+label_padding_x: 10.0
+
+# Vertical padding above and below the text, in logical pixels.
+# Total bar height = font cap-height + 2 × label_padding_y.
+label_padding_y: 4.0
+
+# Corner radius of the active workspace pill, in logical pixels.
+pill_radius: 4.0
