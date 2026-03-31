@@ -43,6 +43,8 @@ use winit::{
 
 // softbuffer is only used on non-macOS platforms
 #[cfg(not(target_os = "macos"))]
+use std::num::NonZeroU32;
+#[cfg(not(target_os = "macos"))]
 use softbuffer::{Context as SbContext, Surface};
 
 // ---------------------------------------------------------------------------
