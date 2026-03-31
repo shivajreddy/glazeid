@@ -228,7 +228,9 @@ impl App {
                     .with_decorations(false)
                     .with_resizable(false)
                     .with_transparent(true)
-                    .with_window_level(WindowLevel::AlwaysOnTop)
+                    // On Windows, use Normal level so fullscreen apps naturally
+                    // cover the bar. AlwaysOnTop would overlay fullscreen games/apps.
+                    .with_window_level(WindowLevel::Normal)
                     .with_position(PhysicalPosition::new(win_x as i32, win_y as i32))
                     .with_inner_size(PhysicalSize::new(content.width.max(1), content.height.max(1)))
             }
