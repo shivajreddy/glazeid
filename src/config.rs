@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use dirs::home_dir;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -135,13 +136,25 @@ impl Config {
         let raw = std::fs::read_to_string(&path)
             .with_context(|| format!("Failed to read config at {}", path.display()))?;
 
-        toml::from_str(&raw)
+        serde_yaml::from_str(&raw)
             .with_context(|| format!("Failed to parse config at {}", path.display()))
     }
 }
 
 /// Returns the platform-appropriate config file path.
+///
+/// macOS:   ~/.config/.glzr/glazeid/config.yaml
+/// Windows: %USERPROFILE%\.glzr\glazeid\config.yaml
 pub fn config_path() -> PathBuf {
-    let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
-    base.join("glazeid").join("config.toml")
+    let home = home_dir().unwrap_or_else(|| PathBuf::from("."));
+
+    #[cfg(target_os = "windows")]
+    return home.join(".glzr").join("glazeid").join("config.yaml");
+
+    #[cfg(not(target_os = "windows"))]
+    return home
+        .join(".config")
+        .join(".glzr")
+        .join("glazeid")
+        .join("config.yaml");
 }
