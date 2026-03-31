@@ -46,6 +46,8 @@ use winit::{
 use std::num::NonZeroU32;
 #[cfg(not(target_os = "macos"))]
 use softbuffer::{Context as SbContext, Surface};
+#[cfg(target_os = "windows")]
+use winit::dpi::{PhysicalPosition, PhysicalSize};
 
 // ---------------------------------------------------------------------------
 // User events (IPC → winit)
@@ -206,9 +208,6 @@ impl App {
             scale,
         );
 
-        let logical_w = (content.width as f32 / scale).ceil() as u32;
-        let logical_h = (content.height as f32 / scale).ceil() as u32;
-
         tracing::debug!(
             device_name, scale,
             geo_x = geo.x, geo_y = geo.y, geo_w = geo.width, geo_h = geo.height,
@@ -216,15 +215,36 @@ impl App {
             "Creating bar window."
         );
 
+        // GlazeWM reports monitor geometry in physical pixels on Windows and
+        // logical pixels on macOS. Use the matching winit coordinate type so
+        // the window lands in the right place on both platforms.
         #[allow(unused_mut)]
-        let mut attrs = Window::default_attributes()
-            .with_title("glazeid")
-            .with_decorations(false)
-            .with_resizable(false)
-            .with_transparent(true)
-            .with_window_level(WindowLevel::AlwaysOnTop)
-            .with_position(LogicalPosition::new(win_x, win_y))
-            .with_inner_size(LogicalSize::new(logical_w.max(1), logical_h.max(1)));
+        let mut attrs = {
+            #[cfg(target_os = "windows")]
+            {
+                Window::default_attributes()
+                    .with_title("glazeid")
+                    .with_decorations(false)
+                    .with_resizable(false)
+                    .with_transparent(true)
+                    .with_window_level(WindowLevel::AlwaysOnTop)
+                    .with_position(PhysicalPosition::new(win_x as i32, win_y as i32))
+                    .with_inner_size(PhysicalSize::new(content.width.max(1), content.height.max(1)))
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                let logical_w = (content.width as f32 / scale).ceil() as u32;
+                let logical_h = (content.height as f32 / scale).ceil() as u32;
+                Window::default_attributes()
+                    .with_title("glazeid")
+                    .with_decorations(false)
+                    .with_resizable(false)
+                    .with_transparent(true)
+                    .with_window_level(WindowLevel::AlwaysOnTop)
+                    .with_position(LogicalPosition::new(win_x, win_y))
+                    .with_inner_size(LogicalSize::new(logical_w.max(1), logical_h.max(1)))
+            }
+        };
 
         #[cfg(target_os = "windows")]
         {
@@ -310,10 +330,20 @@ fn redraw_bar(
 
     if content != bar.last_size {
         let (win_x, win_y) = bar_position_logical(cfg.position, cfg.offset_percent, geo, content, scale);
-        let logical_w = (content.width as f32 / scale).ceil() as u32;
-        let logical_h = (content.height as f32 / scale).ceil() as u32;
-        bar.window.set_outer_position(LogicalPosition::new(win_x, win_y));
-        let _ = bar.window.request_inner_size(LogicalSize::new(logical_w.max(1), logical_h.max(1)));
+
+        #[cfg(target_os = "windows")]
+        {
+            bar.window.set_outer_position(PhysicalPosition::new(win_x as i32, win_y as i32));
+            let _ = bar.window.request_inner_size(PhysicalSize::new(content.width.max(1), content.height.max(1)));
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let logical_w = (content.width as f32 / scale).ceil() as u32;
+            let logical_h = (content.height as f32 / scale).ceil() as u32;
+            bar.window.set_outer_position(LogicalPosition::new(win_x, win_y));
+            let _ = bar.window.request_inner_size(LogicalSize::new(logical_w.max(1), logical_h.max(1)));
+        }
+
         bar.last_size = content;
     }
 
@@ -409,6 +439,12 @@ impl ApplicationHandler<StateChanged> for App {
 // Geometry helpers
 // ---------------------------------------------------------------------------
 
+/// Compute the (x, y) bar origin in the same coordinate space GlazeWM uses.
+///
+/// On macOS: GlazeWM reports logical pixels → divide content (physical) by
+///           scale to get logical content size for offset math.
+/// On Windows: GlazeWM reports physical pixels → content is already physical,
+///             no division needed.
 fn bar_position_logical(
     position: BarPosition,
     offset_percent: f32,
@@ -416,19 +452,25 @@ fn bar_position_logical(
     content: ContentSize,
     scale: f32,
 ) -> (f32, f32) {
-    let content_w_logical = content.width as f32 / scale;
-    let content_h_logical = content.height as f32 / scale;
+    // On Windows GlazeWM coordinates are physical; on macOS they are logical.
+    #[cfg(target_os = "windows")]
+    let (content_w, content_h) = (content.width as f32, content.height as f32);
+    #[cfg(not(target_os = "windows"))]
+    let (content_w, content_h) = (content.width as f32 / scale, content.height as f32 / scale);
+
+    let _ = scale; // suppress unused warning on Windows
+
     let monitor_w = geo.width as f32;
     let monitor_h = geo.height as f32;
 
     let offset_px = (monitor_w * offset_percent / 100.0)
-        .min(monitor_w - content_w_logical)
+        .min(monitor_w - content_w)
         .max(0.0);
 
     let x = geo.x as f32 + offset_px;
     let y = match position {
         BarPosition::Top => geo.y as f32,
-        BarPosition::Bottom => geo.y as f32 + monitor_h - content_h_logical,
+        BarPosition::Bottom => geo.y as f32 + monitor_h - content_h,
     };
 
     (x, y)
