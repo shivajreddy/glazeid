@@ -232,6 +232,15 @@ impl App {
 
         let window = Arc::new(event_loop.create_window(attrs)?);
 
+        // On macOS, raise the window above the menu bar and reposition if needed.
+        #[cfg(target_os = "macos")]
+        if self.cfg.position == config::BarPosition::Top {
+            let menubar_h = macos_raise_above_menubar(&window);
+            // Shift the window up by the menu bar height so it overlaps the menu bar.
+            let new_y = win_y - menubar_h;
+            window.set_outer_position(LogicalPosition::new(win_x, new_y));
+        }
+
         // Build the platform-specific surface.
         let surface = {
             #[cfg(target_os = "macos")]
@@ -461,6 +470,49 @@ fn main() -> Result<()> {
     event_loop.run_app(&mut app)?;
 
     Ok(())
+}
+
+/// Raise the window to `NSStatusWindowLevel` (above the menu bar) and return
+/// the menu bar height in logical pixels so the caller can shift `y` up.
+///
+/// `NSMainMenuWindowLevel = 24`, `NSStatusWindowLevel = 25` — placing at 25
+/// puts the window in the same Z-layer as menu bar extras (clock, wifi, etc.).
+#[cfg(target_os = "macos")]
+fn macos_raise_above_menubar(window: &Window) -> f32 {
+    use objc2::msg_send;
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSScreen, NSStatusWindowLevel};
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    // Raise the NSWindow level above the menu bar.
+    if let Ok(handle) = window.window_handle() {
+        if let RawWindowHandle::AppKit(h) = handle.as_raw() {
+            unsafe {
+                let view: *mut objc2::runtime::AnyObject = h.ns_view.as_ptr().cast();
+                let ns_window: *mut objc2::runtime::AnyObject = msg_send![view, window];
+                if !ns_window.is_null() {
+                    // NSStatusWindowLevel = 25, one above NSMainMenuWindowLevel = 24.
+                    let _: () = msg_send![ns_window, setLevel: NSStatusWindowLevel];
+                }
+            }
+        }
+    }
+
+    // Return the menu bar height (logical px) from the main screen.
+    if let Some(mtm) = MainThreadMarker::new() {
+        if let Some(screen) = NSScreen::mainScreen(mtm) {
+            let full_h = screen.frame().size.height as f32;
+            let visible_frame = screen.visibleFrame();
+            let visible_h = visible_frame.size.height as f32;
+            // visibleFrame.origin.y = dock height (0 if dock is on side or hidden).
+            let dock_h = visible_frame.origin.y as f32;
+            let menubar_h = full_h - visible_h - dock_h;
+            tracing::debug!("macOS menu bar height: {menubar_h} logical px");
+            return menubar_h;
+        }
+    }
+
+    24.0 // sensible fallback
 }
 
 /// Set the macOS application icon from the embedded PNG so it appears in
