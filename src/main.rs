@@ -35,11 +35,12 @@ use tokio::sync::watch;
 use tray_icon::menu::MenuEvent;
 use winit::{
     application::ApplicationHandler,
-    dpi::{LogicalPosition, LogicalSize},
     event::WindowEvent,
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
     window::{Window, WindowId, WindowLevel},
 };
+#[cfg(not(target_os = "windows"))]
+use winit::dpi::{LogicalPosition, LogicalSize};
 
 // softbuffer is only used on non-macOS platforms
 #[cfg(not(target_os = "macos"))]

@@ -10,7 +10,6 @@ fn main() {
 
 #[cfg(target_os = "windows")]
 fn windows_resources() {
-    use std::io::Write;
     use std::path::PathBuf;
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
@@ -38,7 +37,6 @@ fn windows_resources() {
 
 #[cfg(target_os = "windows")]
 fn generate_ico(out: &std::path::PathBuf) {
-    use std::io::Write;
     const LOGO: &[u8] = include_bytes!("resources/glazeid.png");
     const SIZES: &[u32] = &[16, 32, 256];
 
