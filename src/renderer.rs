@@ -195,15 +195,32 @@ impl Renderer {
         // Drop the pixmap borrow before we touch `buffer` again as u32.
         drop(pixmap);
 
-        // tiny_skia writes premultiplied RGBA bytes [R, G, B, A] into memory,
-        // which on little-endian reads as u32 = 0xAABBGGRR.
-        // softbuffer requires u32 = 0x00RRGGBB.
-        // So: zero the high byte (alpha), swap R and B.
+        // tiny_skia writes premultiplied RGBA bytes [R, G, B, A] into memory.
+        // On little-endian this is u32 = 0xAABBGGRR  (A in high byte, R in low).
+        //
+        // Target formats:
+        //   macOS  (CGImage PremultipliedFirst + ByteOrder32Little):
+        //          expects bytes [B, G, R, A] in memory = u32 0xAARRGGBB
+        //          → keep A, swap R↔B.
+        //
+        //   Windows/Linux (softbuffer 0x00RRGGBB):
+        //          alpha ignored by compositor; strip A, swap R↔B.
         for pixel in buffer.iter_mut() {
-            let r = (*pixel) & 0xFF; // R is in low byte (tiny_skia byte[0])
-            let g = (*pixel >> 8) & 0xFF; // G is byte[1]
-            let b = (*pixel >> 16) & 0xFF; // B is byte[2]
-            *pixel = (r << 16) | (g << 8) | b;
+            let r = (*pixel) & 0xFF;
+            let g = (*pixel >> 8) & 0xFF;
+            let b = (*pixel >> 16) & 0xFF;
+            let a = (*pixel >> 24) & 0xFF;
+
+            #[cfg(target_os = "macos")]
+            {
+                *pixel = (a << 24) | (r << 16) | (g << 8) | b;
+            }
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = a;
+                *pixel = (r << 16) | (g << 8) | b;
+            }
         }
     }
 }

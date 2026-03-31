@@ -1,11 +1,17 @@
-use std::io::Write;
-use std::path::PathBuf;
-
 fn main() {
     // Only applies to Windows targets.
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
+
+    #[cfg(target_os = "windows")]
+    windows_resources();
+}
+
+#[cfg(target_os = "windows")]
+fn windows_resources() {
+    use std::io::Write;
+    use std::path::PathBuf;
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let ico_path = out_dir.join("glazeid.ico");
@@ -30,10 +36,9 @@ fn main() {
     }
 }
 
-/// Write a minimal multi-resolution ICO file (16×16, 32×32, 256×256) to
-/// `out`, with each variant PNG-encoded and resized from `resources/glazeid.png`
-/// using Lanczos3.  Windows Vista+ supports PNG-in-ICO natively.
-fn generate_ico(out: &PathBuf) {
+#[cfg(target_os = "windows")]
+fn generate_ico(out: &std::path::PathBuf) {
+    use std::io::Write;
     const LOGO: &[u8] = include_bytes!("resources/glazeid.png");
     const SIZES: &[u32] = &[16, 32, 256];
 
@@ -58,10 +63,9 @@ fn generate_ico(out: &PathBuf) {
     write_ico(out, &images, SIZES);
 }
 
-/// Serialize PNG-encoded `images` into an ICO file at `path`.
-///
-/// ICO format: 6-byte file header, N×16-byte directory entries, then image data.
-fn write_ico(path: &PathBuf, images: &[Vec<u8>], sizes: &[u32]) {
+#[cfg(target_os = "windows")]
+fn write_ico(path: &std::path::PathBuf, images: &[Vec<u8>], sizes: &[u32]) {
+    use std::io::Write;
     let count = images.len() as u16;
     let dir_size = 6 + count as usize * 16;
 

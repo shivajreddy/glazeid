@@ -10,32 +10,40 @@
 /// publishes `BarState` updates through a `watch` channel.  The winit event
 /// loop wakes on a `UserEvent` and redraws + repositions windows only when
 /// state has changed.
+///
+/// Window placement uses the monitor geometry reported by GlazeWM (logical
+/// pixels) rather than winit's `monitor.size()`, which can return inflated
+/// physical pixel counts on HiDPI displays — especially on macOS.
 mod client;
 mod config;
 mod ipc;
 mod renderer;
 mod sys_tray;
 
+#[cfg(target_os = "macos")]
+mod macos_surface;
+
 use std::collections::HashMap;
-use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use anyhow::Result;
-use client::{BarState, MonitorWorkspaces, WorkspaceInfo};
+use client::{BarState, MonitorGeometry, MonitorWorkspaces, WorkspaceInfo};
 use config::{BarPosition, Config};
 use renderer::{ContentSize, Renderer};
-use softbuffer::{Context as SbContext, Surface};
 use sys_tray::Tray;
 use tokio::sync::watch;
 use tray_icon::menu::MenuEvent;
 use winit::{
     application::ApplicationHandler,
-    dpi::{PhysicalPosition, PhysicalSize},
+    dpi::{LogicalPosition, LogicalSize},
     event::WindowEvent,
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
-    monitor::MonitorHandle,
     window::{Window, WindowId, WindowLevel},
 };
+
+// softbuffer is only used on non-macOS platforms
+#[cfg(not(target_os = "macos"))]
+use softbuffer::{Context as SbContext, Surface};
 
 // ---------------------------------------------------------------------------
 // User events (IPC → winit)
@@ -46,20 +54,64 @@ use winit::{
 struct StateChanged;
 
 // ---------------------------------------------------------------------------
+// Platform-abstracted rendering surface
+// ---------------------------------------------------------------------------
+
+enum BarSurface {
+    #[cfg(target_os = "macos")]
+    Macos(macos_surface::MacosSurface),
+    #[cfg(not(target_os = "macos"))]
+    Softbuffer(Surface<Arc<Window>, Arc<Window>>),
+}
+
+impl BarSurface {
+    /// Render into the surface and present. Returns false on error.
+    fn render_and_present(
+        &mut self,
+        w: u32,
+        h: u32,
+        scale: f32,
+        workspaces: &[WorkspaceInfo],
+        cfg: &Config,
+        renderer: &Renderer,
+    ) -> bool {
+        match self {
+            #[cfg(target_os = "macos")]
+            BarSurface::Macos(s) => {
+                s.resize(w, h);
+                renderer.render(s.pixels_mut(), w, h, scale, workspaces, cfg);
+                s.present();
+                true
+            }
+            #[cfg(not(target_os = "macos"))]
+            BarSurface::Softbuffer(s) => {
+                if s.resize(NonZeroU32::new(w).unwrap(), NonZeroU32::new(h).unwrap()).is_err() {
+                    return false;
+                }
+                match s.buffer_mut() {
+                    Ok(mut buf) => {
+                        renderer.render(&mut buf, w, h, scale, workspaces, cfg);
+                        buf.present().is_ok()
+                    }
+                    Err(_) => false,
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Per-bar-window state
 // ---------------------------------------------------------------------------
 
 struct BarWindow {
     window: Arc<Window>,
-    surface: Surface<Arc<Window>, Arc<Window>>,
+    surface: BarSurface,
     /// GlazeWM `device_name` of the monitor this bar lives on.
     device_name: String,
-    scale_factor: f64,
-    /// Monitor geometry in physical pixels (position + size).
-    monitor_pos: PhysicalPosition<i32>,
-    monitor_size: PhysicalSize<u32>,
-    /// Last rendered content size — used to detect whether a window resize is
-    /// needed before painting.
+    /// Scale factor reported by GlazeWM for this monitor.
+    scale_factor: f32,
+    /// Last rendered content size (physical px) — used to skip redundant resizes.
     last_size: ContentSize,
 }
 
@@ -74,10 +126,14 @@ struct App {
     #[allow(dead_code)]
     proxy: EventLoopProxy<StateChanged>,
     bars: HashMap<WindowId, BarWindow>,
+    #[cfg(not(target_os = "macos"))]
     sb_ctx: Option<SbContext<Arc<Window>>>,
     dirty: bool,
     /// Tray icon — installed once on first `resumed`, kept alive for its Drop.
     tray: Option<Tray>,
+    /// Whether windows have been created yet. We defer creation until the first
+    /// real IPC state arrives so that we have valid geometry and workspace data.
+    windows_created: bool,
 }
 
 impl App {
@@ -92,49 +148,70 @@ impl App {
             state_rx,
             proxy,
             bars: HashMap::new(),
+            #[cfg(not(target_os = "macos"))]
             sb_ctx: None,
-            dirty: true,
+            dirty: false,
             tray: None,
+            windows_created: false,
         }
     }
 
-    /// Create one bar window per connected monitor.
+    /// Create one bar window per monitor reported by GlazeWM.
     fn create_windows(&mut self, event_loop: &ActiveEventLoop) {
-        let monitors: Vec<MonitorHandle> = event_loop.available_monitors().collect();
-        tracing::info!("Creating bar windows for {} monitor(s).", monitors.len());
-        for monitor in monitors {
-            if let Err(e) = self.create_bar_for_monitor(event_loop, &monitor) {
-                tracing::warn!("Failed to create bar for monitor: {e:#}");
+        let state = self.state_rx.borrow().clone();
+
+        if state.monitors.is_empty() {
+            tracing::warn!("No monitors in GlazeWM state; skipping window creation.");
+            return;
+        }
+
+        tracing::info!(
+            "Creating bar windows for {} monitor(s) from GlazeWM state.",
+            state.monitors.len()
+        );
+
+        let device_names: Vec<String> = state.monitors.keys().cloned().collect();
+        for device_name in device_names {
+            let mw = state.monitors.get(&device_name).unwrap();
+            if let Err(e) = self.create_bar_for_glazewm_monitor(
+                event_loop,
+                &device_name,
+                &mw.geometry,
+                &mw.workspaces,
+            ) {
+                tracing::warn!("Failed to create bar for monitor {device_name}: {e:#}");
             }
         }
+
+        self.windows_created = true;
     }
 
-    fn create_bar_for_monitor(
+    fn create_bar_for_glazewm_monitor(
         &mut self,
         event_loop: &ActiveEventLoop,
-        monitor: &MonitorHandle,
+        device_name: &str,
+        geo: &MonitorGeometry,
+        workspaces: &[WorkspaceInfo],
     ) -> Result<()> {
-        let scale = monitor.scale_factor();
-        let monitor_pos = monitor.position();
-        let monitor_size = monitor.size();
-        let device_name = monitor_device_name(monitor);
+        let scale = geo.scale_factor;
+        let content = self.renderer.measure(workspaces, &self.cfg, scale);
 
-        // Compute initial size from the current state (likely empty on first
-        // call — that's fine, window will resize on first real state update).
-        let state = self.state_rx.borrow();
-        let empty = MonitorWorkspaces::default();
-        let ws = state.monitors.get(&device_name).unwrap_or(&empty);
-        let content = self
-            .renderer
-            .measure(&ws.workspaces, &self.cfg, scale as f32);
-        drop(state);
-
-        let (win_x, win_y) = bar_position(
+        let (win_x, win_y) = bar_position_logical(
             self.cfg.position,
             self.cfg.offset_percent,
-            monitor_pos,
-            monitor_size,
+            geo,
             content,
+            scale,
+        );
+
+        let logical_w = (content.width as f32 / scale).ceil() as u32;
+        let logical_h = (content.height as f32 / scale).ceil() as u32;
+
+        tracing::debug!(
+            device_name, scale,
+            geo_x = geo.x, geo_y = geo.y, geo_w = geo.width, geo_h = geo.height,
+            win_x, win_y, content_w = content.width, content_h = content.height,
+            "Creating bar window."
         );
 
         #[allow(unused_mut)]
@@ -143,12 +220,10 @@ impl App {
             .with_decorations(false)
             .with_resizable(false)
             .with_transparent(true)
-            .with_window_level(WindowLevel::Normal)
-            .with_position(PhysicalPosition::new(win_x, win_y))
-            .with_inner_size(PhysicalSize::new(content.width.max(1), content.height.max(1)));
+            .with_window_level(WindowLevel::AlwaysOnTop)
+            .with_position(LogicalPosition::new(win_x, win_y))
+            .with_inner_size(LogicalSize::new(logical_w.max(1), logical_h.max(1)));
 
-        // On Windows: remove the taskbar button by setting the tool-window
-        // style (WS_EX_TOOLWINDOW).
         #[cfg(target_os = "windows")]
         {
             use winit::platform::windows::WindowAttributesExtWindows;
@@ -157,26 +232,27 @@ impl App {
 
         let window = Arc::new(event_loop.create_window(attrs)?);
 
-        let ctx = self
-            .sb_ctx
-            .get_or_insert_with(|| SbContext::new(window.clone()).expect("softbuffer context"));
-
-        let mut surface = Surface::new(ctx, window.clone()).expect("softbuffer surface");
-        surface
-            .resize(
-                NonZeroU32::new(content.width.max(1)).unwrap(),
-                NonZeroU32::new(content.height.max(1)).unwrap(),
-            )
-            .ok();
-
-        tracing::debug!(
-            device_name,
-            x = win_x,
-            y = win_y,
-            w = content.width,
-            h = content.height,
-            "Created bar window."
-        );
+        // Build the platform-specific surface.
+        let surface = {
+            #[cfg(target_os = "macos")]
+            {
+                let s = macos_surface::MacosSurface::new(&window)
+                    .ok_or_else(|| anyhow::anyhow!("Failed to create macOS surface"))?;
+                BarSurface::Macos(s)
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let ctx = self.sb_ctx.get_or_insert_with(|| {
+                    SbContext::new(window.clone()).expect("softbuffer context")
+                });
+                let mut s = Surface::new(ctx, window.clone()).expect("softbuffer surface");
+                s.resize(
+                    NonZeroU32::new(content.width.max(1)).unwrap(),
+                    NonZeroU32::new(content.height.max(1)).unwrap(),
+                ).ok();
+                BarSurface::Softbuffer(s)
+            }
+        };
 
         let id = window.id();
         self.bars.insert(
@@ -184,10 +260,8 @@ impl App {
             BarWindow {
                 window,
                 surface,
-                device_name,
+                device_name: device_name.to_string(),
                 scale_factor: scale,
-                monitor_pos,
-                monitor_size,
                 last_size: content,
             },
         );
@@ -199,19 +273,12 @@ impl App {
     fn redraw_all(&mut self) {
         let state = self.state_rx.borrow_and_update().clone();
         let empty = MonitorWorkspaces::default();
-
-        // Collect keys to avoid borrowing `self` mutably in the loop.
         let ids: Vec<WindowId> = self.bars.keys().copied().collect();
 
         for id in ids {
             let bar = self.bars.get_mut(&id).unwrap();
-            let ws = state.monitors.get(&bar.device_name).unwrap_or(&empty);
-            redraw_bar(
-                bar,
-                &ws.workspaces,
-                &self.cfg,
-                &self.renderer,
-            );
+            let mw = state.monitors.get(&bar.device_name).unwrap_or(&empty);
+            redraw_bar(bar, &mw.workspaces, &mw.geometry, &self.cfg, &self.renderer);
         }
 
         self.dirty = false;
@@ -223,53 +290,26 @@ impl App {
 fn redraw_bar(
     bar: &mut BarWindow,
     workspaces: &[WorkspaceInfo],
+    geo: &MonitorGeometry,
     cfg: &Config,
     renderer: &Renderer,
 ) {
-    let scale = bar.scale_factor as f32;
+    let scale = bar.scale_factor;
     let content = renderer.measure(workspaces, cfg, scale);
 
-    // Resize the OS window only when dimensions actually changed.
     if content != bar.last_size {
-        let (win_x, win_y) = bar_position(
-            cfg.position,
-            cfg.offset_percent,
-            bar.monitor_pos,
-            bar.monitor_size,
-            content,
-        );
-        bar.window
-            .set_outer_position(PhysicalPosition::new(win_x, win_y));
-        let _ = bar
-            .window
-            .request_inner_size(PhysicalSize::new(content.width.max(1), content.height.max(1)));
+        let (win_x, win_y) = bar_position_logical(cfg.position, cfg.offset_percent, geo, content, scale);
+        let logical_w = (content.width as f32 / scale).ceil() as u32;
+        let logical_h = (content.height as f32 / scale).ceil() as u32;
+        bar.window.set_outer_position(LogicalPosition::new(win_x, win_y));
+        let _ = bar.window.request_inner_size(LogicalSize::new(logical_w.max(1), logical_h.max(1)));
         bar.last_size = content;
     }
 
     let w = content.width.max(1);
     let h = content.height.max(1);
 
-    if bar.surface.resize(
-        NonZeroU32::new(w).unwrap(),
-        NonZeroU32::new(h).unwrap(),
-    ).is_err() {
-        tracing::warn!("Failed to resize surface for {}", bar.device_name);
-        return;
-    }
-
-    let mut buf = match bar.surface.buffer_mut() {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::warn!("Failed to get surface buffer: {e}");
-            return;
-        }
-    };
-
-    renderer.render(&mut buf, w, h, scale, workspaces, cfg);
-
-    if let Err(e) = buf.present() {
-        tracing::warn!("Failed to present surface buffer: {e}");
-    }
+    bar.surface.render_and_present(w, h, scale, workspaces, cfg, renderer);
 }
 
 // ---------------------------------------------------------------------------
@@ -278,14 +318,23 @@ fn redraw_bar(
 
 impl ApplicationHandler<StateChanged> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.bars.is_empty() {
-            self.create_windows(event_loop);
-            self.dirty = true;
-        }
+        // Set the app icon here — NSApp is guaranteed to be ready once the
+        // event loop has started and resumed is called.
+        #[cfg(target_os = "macos")]
+        set_macos_app_icon();
+
         if self.tray.is_none() {
             match Tray::new() {
                 Ok(t) => self.tray = Some(t),
                 Err(e) => tracing::warn!("Failed to create tray icon: {e:#}"),
+            }
+        }
+
+        if !self.windows_created {
+            let has_monitors = !self.state_rx.borrow().monitors.is_empty();
+            if has_monitors {
+                self.create_windows(event_loop);
+                self.dirty = true;
             }
         }
     }
@@ -301,20 +350,19 @@ impl ApplicationHandler<StateChanged> for App {
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => {
-                // Explicit OS redraw request — paint with current state.
                 if let Some(bar) = self.bars.get_mut(&window_id) {
                     let state = self.state_rx.borrow();
                     let empty = MonitorWorkspaces::default();
-                    let ws = state.monitors.get(&bar.device_name).unwrap_or(&empty);
-                    let workspaces = ws.workspaces.clone();
+                    let mw = state.monitors.get(&bar.device_name).unwrap_or(&empty);
+                    let workspaces = mw.workspaces.clone();
+                    let geo = mw.geometry.clone();
                     drop(state);
-                    redraw_bar(bar, &workspaces, &self.cfg, &self.renderer);
+                    redraw_bar(bar, &workspaces, &geo, &self.cfg, &self.renderer);
                 }
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 if let Some(bar) = self.bars.get_mut(&window_id) {
-                    bar.scale_factor = scale_factor;
-                    // Force a full remeasure next redraw.
+                    bar.scale_factor = scale_factor as f32;
                     bar.last_size = ContentSize { width: 0, height: 0 };
                 }
                 self.dirty = true;
@@ -323,14 +371,15 @@ impl ApplicationHandler<StateChanged> for App {
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: StateChanged) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, _event: StateChanged) {
+        if !self.windows_created {
+            self.create_windows(event_loop);
+        }
         self.dirty = true;
         self.redraw_all();
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // Poll tray menu events — tray-icon posts them to a channel that must
-        // be drained on the main thread.
         if let Some(tray) = &self.tray {
             while let Ok(event) = MenuEvent::receiver().try_recv() {
                 if event.id == tray.quit_id {
@@ -349,40 +398,29 @@ impl ApplicationHandler<StateChanged> for App {
 // Geometry helpers
 // ---------------------------------------------------------------------------
 
-/// Compute the physical pixel (x, y) origin for the bar window.
-///
-/// For `Bottom` and `Top`, the bar is placed along the horizontal edge of the
-/// monitor.  `offset_percent` shifts it from the left: `0.0` = left-most,
-/// `50.0` = centred, `100.0` = right edge (clamped so the bar never extends
-/// past the right edge of the monitor).
-fn bar_position(
+fn bar_position_logical(
     position: BarPosition,
     offset_percent: f32,
-    monitor_pos: PhysicalPosition<i32>,
-    monitor_size: PhysicalSize<u32>,
+    geo: &MonitorGeometry,
     content: ContentSize,
-) -> (i32, i32) {
-    let offset_px =
-        ((monitor_size.width as f32 * offset_percent / 100.0) as i32)
-            // Clamp so the bar never clips past the right edge.
-            .min(monitor_size.width as i32 - content.width as i32)
-            .max(0);
+    scale: f32,
+) -> (f32, f32) {
+    let content_w_logical = content.width as f32 / scale;
+    let content_h_logical = content.height as f32 / scale;
+    let monitor_w = geo.width as f32;
+    let monitor_h = geo.height as f32;
 
-    let x = monitor_pos.x + offset_px;
+    let offset_px = (monitor_w * offset_percent / 100.0)
+        .min(monitor_w - content_w_logical)
+        .max(0.0);
 
+    let x = geo.x as f32 + offset_px;
     let y = match position {
-        BarPosition::Top => monitor_pos.y,
-        BarPosition::Bottom => {
-            monitor_pos.y + monitor_size.height as i32 - content.height as i32
-        }
+        BarPosition::Top => geo.y as f32,
+        BarPosition::Bottom => geo.y as f32 + monitor_h - content_h_logical,
     };
 
     (x, y)
-}
-
-/// Extract a stable device identifier from a `MonitorHandle`.
-fn monitor_device_name(monitor: &MonitorHandle) -> String {
-    monitor.name().unwrap_or_else(|| "primary".into())
 }
 
 // ---------------------------------------------------------------------------
@@ -404,11 +442,19 @@ fn main() -> Result<()> {
         .enable_all()
         .build()?;
 
-    let event_loop = EventLoop::<StateChanged>::with_user_event().build()?;
+    #[allow(unused_mut)]
+    let mut event_loop_builder = EventLoop::<StateChanged>::with_user_event();
+
+    #[cfg(target_os = "macos")]
+    {
+        use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+        event_loop_builder.with_activation_policy(ActivationPolicy::Accessory);
+    }
+
+    let event_loop = event_loop_builder.build()?;
     event_loop.set_control_flow(ControlFlow::Wait);
 
     let proxy = event_loop.create_proxy();
-
     let state_rx = rt.block_on(async { spawn_ipc_watcher(&cfg, proxy.clone()) });
 
     let mut app = App::new(cfg, state_rx, proxy);
@@ -417,8 +463,30 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Spawn the IPC client and a watcher that fires `StateChanged` into the winit
-/// event loop on every state update.
+/// Set the macOS application icon from the embedded PNG so it appears in
+/// Activity Monitor and the Force Quit dialog.
+///
+/// Plain binaries (not .app bundles) have no Info.plist/icns, so the icon
+/// must be set programmatically via NSApp.
+#[cfg(target_os = "macos")]
+fn set_macos_app_icon() {
+    use objc2::AnyThread;
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSApplication, NSImage};
+    use objc2_foundation::NSData;
+
+    const LOGO_PNG: &[u8] = include_bytes!("../resources/glazeid.png");
+
+    let Some(mtm) = MainThreadMarker::new() else { return };
+
+    unsafe {
+        let data = NSData::with_bytes(LOGO_PNG);
+        let Some(image) = NSImage::initWithData(NSImage::alloc(), &data) else { return };
+        let app = NSApplication::sharedApplication(mtm);
+        app.setApplicationIconImage(Some(&image));
+    }
+}
+
 fn spawn_ipc_watcher(
     cfg: &Config,
     proxy: EventLoopProxy<StateChanged>,
@@ -428,12 +496,8 @@ fn spawn_ipc_watcher(
 
     tokio::spawn(async move {
         loop {
-            if watcher_rx.changed().await.is_err() {
-                break;
-            }
-            if proxy.send_event(StateChanged).is_err() {
-                break;
-            }
+            if watcher_rx.changed().await.is_err() { break; }
+            if proxy.send_event(StateChanged).is_err() { break; }
         }
     });
 

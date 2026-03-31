@@ -21,11 +21,24 @@ use crate::ipc::{
 // Public state type
 // ---------------------------------------------------------------------------
 
+/// Monitor geometry as reported by GlazeWM (logical pixels).
+#[derive(Clone, Debug, Default)]
+pub struct MonitorGeometry {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+    pub scale_factor: f32,
+}
+
 /// Workspace info for a single monitor, ready for the renderer.
 #[derive(Clone, Debug, Default)]
 pub struct MonitorWorkspaces {
     /// Workspaces on this monitor, in the order returned by GlazeWM.
     pub workspaces: Vec<WorkspaceInfo>,
+    /// Monitor geometry from GlazeWM (logical pixels, same coordinate space
+    /// GlazeWM uses — reliable across Windows and macOS).
+    pub geometry: MonitorGeometry,
 }
 
 /// Lean representation of a single workspace.
@@ -61,9 +74,16 @@ impl BarState {
                 .filter_map(|c| c.as_workspace())
                 .map(workspace_info)
                 .collect();
+            let geometry = MonitorGeometry {
+                x: m.x,
+                y: m.y,
+                width: m.width,
+                height: m.height,
+                scale_factor: m.scale_factor,
+            };
             state.monitors.insert(
                 m.device_name.clone(),
-                MonitorWorkspaces { workspaces },
+                MonitorWorkspaces { workspaces, geometry },
             );
         }
         state
