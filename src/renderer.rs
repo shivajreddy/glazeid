@@ -119,6 +119,13 @@ impl Renderer {
             return;
         }
 
+        // On macOS we reuse a Vec<u32> across frames, so stale anti-aliased
+        // pixels from a previously active pill can bleed through. Zero the
+        // buffer before painting to guarantee a clean slate.
+        // On Windows softbuffer provides a fresh zeroed buffer each frame.
+        #[cfg(target_os = "macos")]
+        buffer.fill(0);
+
         let mut pixmap = PixmapMut::from_bytes(bytemuck_u32_to_u8_mut(buffer), width, height)
             .expect("buffer size matches width × height × 4");
 
