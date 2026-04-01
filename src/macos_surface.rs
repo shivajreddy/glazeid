@@ -54,6 +54,9 @@ impl MacosSurface {
                 let ns_window: &NSWindow = &*(ns_window_ptr as *const NSWindow);
                 ns_window.setOpaque(false);
                 ns_window.setBackgroundColor(Some(&NSColor::clearColor()));
+                // Disable the window drop shadow — it appears as a faint
+                // border around the transparent window edges.
+                ns_window.setHasShadow(false);
             }
 
             Some(Self {
