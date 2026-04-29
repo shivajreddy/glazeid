@@ -20,8 +20,8 @@ const TRAY_SIZE: u32 = 32;
 
 /// Owned tray icon handle.  Drop to remove the icon from the system tray.
 pub struct Tray {
-    /// Kept alive for its Drop impl which removes the tray icon.
-    _icon: TrayIcon,
+    /// Kept alive for its Drop impl. If None, no icon is shown.
+    _icon: Option<TrayIcon>,
     /// Menu item ID for "Quit" — compared against incoming `MenuEvent`s.
     pub quit_id: tray_icon::menu::MenuId,
 }
@@ -29,7 +29,10 @@ pub struct Tray {
 impl Tray {
     /// Install the tray icon.  Must be called on the main thread after the
     /// winit event loop has started (required by Win32).
-    pub fn new() -> Result<Self> {
+    pub fn new(hidden: bool) -> Result<Option<Self>> {
+        if hidden {
+            return Ok(None);
+        }
         let quit_item = MenuItem::new("Quit glazeid", true, None);
         let quit_id = quit_item.id().clone();
 
@@ -44,10 +47,10 @@ impl Tray {
             .with_icon(icon)
             .build()?;
 
-        Ok(Self {
-            _icon: tray,
+        Ok(Some(Self {
+            _icon: Some(tray),
             quit_id,
-        })
+        }))
     }
 }
 

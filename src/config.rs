@@ -98,6 +98,9 @@ pub struct Config {
 
     /// Corner radius of the active workspace pill, in logical pixels.
     pub pill_radius: f32,
+
+    /// Hide the tray icon on macOS
+    pub macos_trayicon_hidden: bool,
 }
 
 impl Default for Config {
@@ -115,6 +118,7 @@ impl Default for Config {
             label_padding_x: 10.0,
             label_padding_y: 4.0,
             pill_radius: 4.0,
+            macos_trayicon_hidden: false,
         }
     }
 }

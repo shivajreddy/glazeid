@@ -1,4 +1,3 @@
-
 /// glazeid — a minimal GlazeWM workspace bar.
 ///
 /// One window is created per monitor.  Its size is driven entirely by content:
@@ -33,20 +32,20 @@ use renderer::{ContentSize, Renderer};
 use sys_tray::Tray;
 use tokio::sync::watch;
 use tray_icon::menu::MenuEvent;
+#[cfg(not(target_os = "windows"))]
+use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::{
     application::ApplicationHandler,
     event::WindowEvent,
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
     window::{Window, WindowId, WindowLevel},
 };
-#[cfg(not(target_os = "windows"))]
-use winit::dpi::{LogicalPosition, LogicalSize};
 
 // softbuffer is only used on non-macOS platforms
 #[cfg(not(target_os = "macos"))]
-use std::num::NonZeroU32;
-#[cfg(not(target_os = "macos"))]
 use softbuffer::{Context as SbContext, Surface};
+#[cfg(not(target_os = "macos"))]
+use std::num::NonZeroU32;
 #[cfg(target_os = "windows")]
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 
@@ -90,7 +89,9 @@ impl BarSurface {
             }
             #[cfg(not(target_os = "macos"))]
             BarSurface::Softbuffer(s) => {
-                if s.resize(NonZeroU32::new(w).unwrap(), NonZeroU32::new(h).unwrap()).is_err() {
+                if s.resize(NonZeroU32::new(w).unwrap(), NonZeroU32::new(h).unwrap())
+                    .is_err()
+                {
                     return false;
                 }
                 match s.buffer_mut() {
@@ -210,9 +211,16 @@ impl App {
         );
 
         tracing::debug!(
-            device_name, scale,
-            geo_x = geo.x, geo_y = geo.y, geo_w = geo.width, geo_h = geo.height,
-            win_x, win_y, content_w = content.width, content_h = content.height,
+            device_name,
+            scale,
+            geo_x = geo.x,
+            geo_y = geo.y,
+            geo_w = geo.width,
+            geo_h = geo.height,
+            win_x,
+            win_y,
+            content_w = content.width,
+            content_h = content.height,
             "Creating bar window."
         );
 
@@ -232,7 +240,10 @@ impl App {
                     // cover the bar. AlwaysOnTop would overlay fullscreen games/apps.
                     .with_window_level(WindowLevel::Normal)
                     .with_position(PhysicalPosition::new(win_x as i32, win_y as i32))
-                    .with_inner_size(PhysicalSize::new(content.width.max(1), content.height.max(1)))
+                    .with_inner_size(PhysicalSize::new(
+                        content.width.max(1),
+                        content.height.max(1),
+                    ))
             }
             #[cfg(not(target_os = "windows"))]
             {
@@ -283,7 +294,8 @@ impl App {
                 s.resize(
                     NonZeroU32::new(content.width.max(1)).unwrap(),
                     NonZeroU32::new(content.height.max(1)).unwrap(),
-                ).ok();
+                )
+                .ok();
                 BarSurface::Softbuffer(s)
             }
         };
@@ -332,19 +344,27 @@ fn redraw_bar(
     let content = renderer.measure(workspaces, cfg, scale);
 
     if content != bar.last_size {
-        let (win_x, win_y) = bar_position_logical(cfg.position, cfg.offset_percent, geo, content, scale);
+        let (win_x, win_y) =
+            bar_position_logical(cfg.position, cfg.offset_percent, geo, content, scale);
 
         #[cfg(target_os = "windows")]
         {
-            bar.window.set_outer_position(PhysicalPosition::new(win_x as i32, win_y as i32));
-            let _ = bar.window.request_inner_size(PhysicalSize::new(content.width.max(1), content.height.max(1)));
+            bar.window
+                .set_outer_position(PhysicalPosition::new(win_x as i32, win_y as i32));
+            let _ = bar.window.request_inner_size(PhysicalSize::new(
+                content.width.max(1),
+                content.height.max(1),
+            ));
         }
         #[cfg(not(target_os = "windows"))]
         {
             let logical_w = (content.width as f32 / scale).ceil() as u32;
             let logical_h = (content.height as f32 / scale).ceil() as u32;
-            bar.window.set_outer_position(LogicalPosition::new(win_x, win_y));
-            let _ = bar.window.request_inner_size(LogicalSize::new(logical_w.max(1), logical_h.max(1)));
+            bar.window
+                .set_outer_position(LogicalPosition::new(win_x, win_y));
+            let _ = bar
+                .window
+                .request_inner_size(LogicalSize::new(logical_w.max(1), logical_h.max(1)));
         }
 
         bar.last_size = content;
@@ -353,7 +373,8 @@ fn redraw_bar(
     let w = content.width.max(1);
     let h = content.height.max(1);
 
-    bar.surface.render_and_present(w, h, scale, workspaces, cfg, renderer);
+    bar.surface
+        .render_and_present(w, h, scale, workspaces, cfg, renderer);
 }
 
 // ---------------------------------------------------------------------------
@@ -368,8 +389,13 @@ impl ApplicationHandler<StateChanged> for App {
         set_macos_app_icon();
 
         if self.tray.is_none() {
-            match Tray::new() {
-                Ok(t) => self.tray = Some(t),
+            // Determine if it should be hidden based on OS and config
+            let is_macos = cfg!(target_os = "macos");
+            let should_hide = is_macos && self.cfg.macos_trayicon_hidden;
+
+            match Tray::new(should_hide) {
+                Ok(Some(t)) => self.tray = Some(t),
+                Ok(None) => tracing::info!("Tray icon disabled by config"),
                 Err(e) => tracing::warn!("Failed to create tray icon: {e:#}"),
             }
         }
@@ -407,7 +433,10 @@ impl ApplicationHandler<StateChanged> for App {
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 if let Some(bar) = self.bars.get_mut(&window_id) {
                     bar.scale_factor = scale_factor as f32;
-                    bar.last_size = ContentSize { width: 0, height: 0 };
+                    bar.last_size = ContentSize {
+                        width: 0,
+                        height: 0,
+                    };
                 }
                 self.dirty = true;
             }
@@ -486,8 +515,7 @@ fn bar_position_logical(
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -576,11 +604,15 @@ fn set_macos_app_icon() {
 
     const LOGO_PNG: &[u8] = include_bytes!("../resources/glazeid.png");
 
-    let Some(mtm) = MainThreadMarker::new() else { return };
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
 
     unsafe {
         let data = NSData::with_bytes(LOGO_PNG);
-        let Some(image) = NSImage::initWithData(NSImage::alloc(), &data) else { return };
+        let Some(image) = NSImage::initWithData(NSImage::alloc(), &data) else {
+            return;
+        };
         let app = NSApplication::sharedApplication(mtm);
         app.setApplicationIconImage(Some(&image));
     }
@@ -595,8 +627,12 @@ fn spawn_ipc_watcher(
 
     tokio::spawn(async move {
         loop {
-            if watcher_rx.changed().await.is_err() { break; }
-            if proxy.send_event(StateChanged).is_err() { break; }
+            if watcher_rx.changed().await.is_err() {
+                break;
+            }
+            if proxy.send_event(StateChanged).is_err() {
+                break;
+            }
         }
     });
 
