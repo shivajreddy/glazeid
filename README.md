@@ -75,6 +75,13 @@ position: "bottom"
 # 0.0 = left-most (default), 50.0 = centred, 100.0 = right edge.
 offset_percent: 0.0
 
+# Windows only (ignored on macOS).
+# How far the bar sits from the edge it docks to, in logical pixels.
+# 0.0 = flush with the edge (default). Larger values move the bar inwards:
+# down from the top edge, or up from the bottom edge. Use this to centre the
+# bar vertically inside the taskbar.
+windows_edge_offset: 0.0
+
 # GlazeWM WebSocket IPC port.
 glazewm_port: 6123
 

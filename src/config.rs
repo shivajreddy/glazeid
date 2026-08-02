@@ -68,6 +68,17 @@ pub struct Config {
     /// (bar would be flush with the right edge).
     pub offset_percent: f32,
 
+    /// How far the bar sits from the edge it docks to, in logical pixels.
+    ///
+    /// **Windows only** — ignored on macOS.
+    ///
+    /// `0.0` (default) is flush with the edge. Larger values move the bar
+    /// inwards — down from the top edge, or up from the bottom edge — which is
+    /// what you want to centre it vertically inside the taskbar.
+    ///
+    /// Clamped so the bar always stays on the monitor.
+    pub windows_edge_offset: f32,
+
     /// GlazeWM IPC port.
     pub glazewm_port: u16,
 
@@ -108,6 +119,7 @@ impl Default for Config {
         Self {
             position: BarPosition::Bottom,
             offset_percent: 0.0,
+            windows_edge_offset: 0.0,
             glazewm_port: 6123,
             reconnect_delay_ms: 2000,
             background: Color("#00000000".into()),

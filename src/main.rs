@@ -210,13 +210,7 @@ impl App {
         let scale = geo.scale_factor;
         let content = self.renderer.measure(workspaces, &self.cfg, scale);
 
-        let (win_x, win_y) = bar_position_logical(
-            self.cfg.position,
-            self.cfg.offset_percent,
-            geo,
-            content,
-            scale,
-        );
+        let (win_x, win_y) = bar_position_logical(&self.cfg, geo, content, scale);
 
         tracing::debug!(
             device_name,
@@ -376,8 +370,7 @@ fn redraw_bar(
     let content = renderer.measure(workspaces, cfg, scale);
 
     if content != bar.last_size {
-        let (win_x, win_y) =
-            bar_position_logical(cfg.position, cfg.offset_percent, geo, content, scale);
+        let (win_x, win_y) = bar_position_logical(cfg, geo, content, scale);
 
         #[cfg(target_os = "windows")]
         {
@@ -520,8 +513,7 @@ impl ApplicationHandler<StateChanged> for App {
 /// On Windows: GlazeWM reports physical pixels → content is already physical,
 ///             no division needed.
 fn bar_position_logical(
-    position: BarPosition,
-    offset_percent: f32,
+    cfg: &Config,
     geo: &MonitorGeometry,
     content: ContentSize,
     scale: f32,
@@ -532,19 +524,28 @@ fn bar_position_logical(
     #[cfg(not(target_os = "windows"))]
     let (content_w, content_h) = (content.width as f32 / scale, content.height as f32 / scale);
 
-    let _ = scale; // suppress unused warning on Windows
-
     let monitor_w = geo.width as f32;
     let monitor_h = geo.height as f32;
 
-    let offset_px = (monitor_w * offset_percent / 100.0)
+    // Distance along the docked edge.
+    let along_edge = (monitor_w * cfg.offset_percent / 100.0)
         .min(monitor_w - content_w)
         .max(0.0);
 
-    let x = geo.x as f32 + offset_px;
-    let y = match position {
-        BarPosition::Top => geo.y as f32,
-        BarPosition::Bottom => geo.y as f32 + monitor_h - content_h,
+    // Distance inwards from the docked edge. Windows only — macOS keeps the bar
+    // flush with the edge, since placement there also has to account for the
+    // menu bar. Config lengths are logical pixels and GlazeWM reports physical
+    // ones on Windows, so scale it; clamp so the bar stays on the monitor.
+    #[cfg(target_os = "windows")]
+    let from_edge =
+        (cfg.windows_edge_offset * scale).clamp(0.0, (monitor_h - content_h).max(0.0));
+    #[cfg(not(target_os = "windows"))]
+    let from_edge = 0.0_f32;
+
+    let x = geo.x as f32 + along_edge;
+    let y = match cfg.position {
+        BarPosition::Top => geo.y as f32 + from_edge,
+        BarPosition::Bottom => geo.y as f32 + monitor_h - content_h - from_edge,
     };
 
     (x, y)
