@@ -120,6 +120,15 @@ Colors are hex strings: `"#rrggbb"` (fully opaque) or `"#rrggbbaa"` (with alpha)
 | Text | `fontdue` — rasterizes the embedded JetBrains Mono TTF |
 | IPC | `tokio-tungstenite` — WebSocket client to GlazeWM on port 6123 |
 | State | `tokio::sync::watch` — IPC task pushes updates; bar redraws only on change |
+| Z-order (Windows) | 1s tick — keeps the bar above the taskbar and hides it under fullscreen apps |
+
+On Windows the taskbar is itself a topmost window, so the bar has to be topmost
+too in order to draw over it. Topmost is a band rather than a fixed position,
+though: the shell pushes the taskbar back to the front of that band whenever an
+app goes fullscreen, and never lowers it again. The bar therefore re-checks its
+z-order once a second and reclaims its place, and hides itself while a
+fullscreen window covers its monitor. The check is cheap enough not to register
+on the process CPU time.
 
 ## License
 

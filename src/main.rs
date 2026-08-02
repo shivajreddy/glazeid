@@ -22,6 +22,9 @@ mod sys_tray;
 #[cfg(target_os = "macos")]
 mod macos_surface;
 
+#[cfg(target_os = "windows")]
+mod win_zorder;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -56,6 +59,11 @@ use winit::dpi::{PhysicalPosition, PhysicalSize};
 /// Sent by the IPC watch task whenever the `BarState` changes.
 #[derive(Debug)]
 struct StateChanged;
+
+/// How often the bar re-checks its z-order on Windows. Slow enough to be free
+/// in practice, quick enough that the bar cannot stay buried for long.
+#[cfg(target_os = "windows")]
+const Z_ORDER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 // ---------------------------------------------------------------------------
 // Platform-abstracted rendering surface
@@ -236,9 +244,9 @@ impl App {
                     .with_decorations(false)
                     .with_resizable(false)
                     .with_transparent(true)
-                    // On Windows, use Normal level so fullscreen apps naturally
-                    // cover the bar. AlwaysOnTop would overlay fullscreen games/apps.
-                    .with_window_level(WindowLevel::Normal)
+                    // The taskbar is itself WS_EX_TOPMOST, so the bar has to be
+                    // topmost as well in order to draw above it.
+                    .with_window_level(WindowLevel::AlwaysOnTop)
                     .with_position(PhysicalPosition::new(win_x as i32, win_y as i32))
                     .with_inner_size(PhysicalSize::new(
                         content.width.max(1),
@@ -313,6 +321,30 @@ impl App {
         );
 
         Ok(())
+    }
+
+    /// Keep each bar in the right place in the z-order.
+    ///
+    /// Runs once per `Z_ORDER_INTERVAL` because the shell silently raises the
+    /// taskbar above the bar whenever an app goes fullscreen; see `win_zorder`
+    /// for the measurements.
+    #[cfg(target_os = "windows")]
+    fn apply_z_order(&mut self) {
+        for bar in self.bars.values() {
+            let fullscreen = win_zorder::monitor_is_fullscreen(&bar.window);
+
+            // Hide under fullscreen apps. Comparing against the real window
+            // state means a request the system ignored is retried next tick.
+            if fullscreen != win_zorder::is_hidden(&bar.window) {
+                win_zorder::set_hidden(&bar.window, fullscreen);
+            }
+
+            // Otherwise make sure the taskbar has not crept in front of us.
+            // Checking first avoids a SetWindowPos on every single tick.
+            if !fullscreen && win_zorder::taskbar_is_above(&bar.window) {
+                win_zorder::raise_to_front(&bar.window);
+            }
+        }
     }
 
     /// Redraw every bar window, resizing and repositioning as needed.
@@ -463,6 +495,16 @@ impl ApplicationHandler<StateChanged> for App {
 
         if self.dirty {
             self.redraw_all();
+        }
+
+        // Re-check the z-order on a slow tick and go back to sleep until the
+        // next one. This is the only reason the event loop wakes on its own.
+        #[cfg(target_os = "windows")]
+        {
+            self.apply_z_order();
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                std::time::Instant::now() + Z_ORDER_INTERVAL,
+            ));
         }
     }
 }
