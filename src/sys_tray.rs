@@ -3,7 +3,7 @@
 /// Creates a tray icon with a single "Quit" menu item.  The icon is loaded
 /// from the bundled `resources/glazeid.png` logo, resized to 32×32 at runtime.
 ///
-/// Menu events are polled in the winit `about_to_wait` callback via
+/// Menu events are polled in the main message loop via
 /// `MenuEvent::receiver().try_recv()`.
 use anyhow::Result;
 use image::imageops::FilterType;
@@ -20,19 +20,16 @@ const TRAY_SIZE: u32 = 32;
 
 /// Owned tray icon handle.  Drop to remove the icon from the system tray.
 pub struct Tray {
-    /// Kept alive for its Drop impl. If None, no icon is shown.
-    _icon: Option<TrayIcon>,
+    /// Kept alive for its Drop impl.
+    _icon: TrayIcon,
     /// Menu item ID for "Quit" — compared against incoming `MenuEvent`s.
     pub quit_id: tray_icon::menu::MenuId,
 }
 
 impl Tray {
-    /// Install the tray icon.  Must be called on the main thread after the
-    /// winit event loop has started (required by Win32).
-    pub fn new(hidden: bool) -> Result<Option<Self>> {
-        if hidden {
-            return Ok(None);
-        }
+    /// Install the tray icon.  Must be called on the thread that runs the
+    /// message loop (required by Win32).
+    pub fn new() -> Result<Self> {
         let quit_item = MenuItem::new("Quit glazeid", true, None);
         let quit_id = quit_item.id().clone();
 
@@ -47,10 +44,10 @@ impl Tray {
             .with_icon(icon)
             .build()?;
 
-        Ok(Some(Self {
-            _icon: Some(tray),
+        Ok(Self {
+            _icon: tray,
             quit_id,
-        }))
+        })
     }
 }
 

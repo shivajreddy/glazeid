@@ -3,20 +3,6 @@ use dirs::home_dir;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// Which screen edge the bar docks to.
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum BarPosition {
-    Top,
-    Bottom,
-}
-
-impl Default for BarPosition {
-    fn default() -> Self {
-        Self::Bottom
-    }
-}
-
 /// RGBA color stored as a hex string (e.g. `"#1e1e2e"` or `"#1e1e2eff"`).
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Color(pub String);
@@ -53,31 +39,19 @@ impl Color {
 
 /// Top-level config file schema.
 ///
-/// Loaded from `%APPDATA%\glazeid\config.toml` on Windows, with sane defaults
-/// when the file is absent.
+/// Loaded from `%USERPROFILE%\.glzr\glazeid\config.yaml`, with sane defaults
+/// when the file is absent or empty. Unknown keys (e.g. options from older
+/// glazeid versions such as `position`) are ignored.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
-    /// Which screen edge the bar docks to (`"top"` or `"bottom"`).
-    pub position: BarPosition,
-
-    /// How far along the edge to place the bar, as a percentage of the
-    /// monitor's width (for top/bottom) in the range `0.0`–`100.0`.
+    /// How far along the taskbar to place the widget, as a percentage of the
+    /// taskbar's width, in the range `0.0`–`100.0`.
     ///
-    /// `0.0` = left-most (default), `50.0` = centred, `100.0` = right-most
-    /// (bar would be flush with the right edge).
+    /// `0.0` = left edge (default), `50.0` = centred, `100.0` = flush with
+    /// the right edge. Clamped so the widget always stays fully on the
+    /// taskbar. The widget is always centred vertically inside the taskbar.
     pub offset_percent: f32,
-
-    /// How far the bar sits from the edge it docks to, in logical pixels.
-    ///
-    /// **Windows only** — ignored on macOS.
-    ///
-    /// `0.0` (default) is flush with the edge. Larger values move the bar
-    /// inwards — down from the top edge, or up from the bottom edge — which is
-    /// what you want to centre it vertically inside the taskbar.
-    ///
-    /// Clamped so the bar always stays on the monitor.
-    pub windows_edge_offset: f32,
 
     /// GlazeWM IPC port.
     pub glazewm_port: u16,
@@ -85,7 +59,8 @@ pub struct Config {
     /// Milliseconds to wait before retrying a failed IPC connection.
     pub reconnect_delay_ms: u64,
 
-    /// Background color of the bar.
+    /// Background color of the widget. The default is fully transparent, so
+    /// only the workspace pills are visible on the taskbar.
     pub background: Color,
 
     /// Text color for inactive workspaces.
@@ -104,22 +79,17 @@ pub struct Config {
     pub label_padding_x: f32,
 
     /// Vertical padding above and below the text inside each pill, in logical
-    /// pixels.  The total bar height = font cap-height + 2 × label_padding_y.
+    /// pixels.  The total widget height = font cap-height + 2 × label_padding_y.
     pub label_padding_y: f32,
 
     /// Corner radius of the active workspace pill, in logical pixels.
     pub pill_radius: f32,
-
-    /// Hide the tray icon on macOS
-    pub macos_trayicon_hidden: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            position: BarPosition::Bottom,
             offset_percent: 0.0,
-            windows_edge_offset: 0.0,
             glazewm_port: 6123,
             reconnect_delay_ms: 2000,
             background: Color("#00000000".into()),
@@ -130,14 +100,14 @@ impl Default for Config {
             label_padding_x: 10.0,
             label_padding_y: 4.0,
             pill_radius: 4.0,
-            macos_trayicon_hidden: false,
         }
     }
 }
 
 impl Config {
-    /// Load the config from disk, falling back to defaults if the file does not
-    /// exist. Returns an error only if the file exists but cannot be parsed.
+    /// Load the config from disk, falling back to defaults if the file does
+    /// not exist or is empty. Returns an error only if the file exists but
+    /// cannot be parsed.
     pub fn load() -> Result<Self> {
         let path = config_path();
 
@@ -152,25 +122,24 @@ impl Config {
         let raw = std::fs::read_to_string(&path)
             .with_context(|| format!("Failed to read config at {}", path.display()))?;
 
-        serde_yaml::from_str(&raw)
-            .with_context(|| format!("Failed to parse config at {}", path.display()))
+        // An empty file — or one containing only comments — deserializes as
+        // YAML `null`, not as an empty mapping. Treat both as "all defaults".
+        if raw.trim().is_empty() {
+            tracing::debug!(path = %path.display(), "Config file is empty, using defaults.");
+            return Ok(Self::default());
+        }
+
+        let parsed: Option<Self> = serde_yaml::from_str(&raw)
+            .with_context(|| format!("Failed to parse config at {}", path.display()))?;
+
+        Ok(parsed.unwrap_or_default())
     }
 }
 
-/// Returns the platform-appropriate config file path.
+/// Returns the config file path: `%USERPROFILE%\.glzr\glazeid\config.yaml`.
 ///
-/// macOS:   ~/.config/.glzr/glazeid/config.yaml
-/// Windows: %USERPROFILE%\.glzr\glazeid\config.yaml
+/// Symlinked directories (e.g. dotfiles setups) are followed transparently.
 pub fn config_path() -> PathBuf {
     let home = home_dir().unwrap_or_else(|| PathBuf::from("."));
-
-    #[cfg(target_os = "windows")]
-    return home.join(".glzr").join("glazeid").join("config.yaml");
-
-    #[cfg(not(target_os = "windows"))]
-    return home
-        .join(".config")
-        .join(".glzr")
-        .join("glazeid")
-        .join("config.yaml");
+    home.join(".glzr").join("glazeid").join("config.yaml")
 }

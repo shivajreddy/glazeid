@@ -4,24 +4,29 @@
 
 <h1 align="center">glazeid</h1>
 
-<p align="center">A minimal, extremely efficient workspace bar for <a href="https://github.com/glzr-io/glazewm">GlazeWM</a>.</p>
+<p align="center">A minimal, extremely efficient workspace widget for <a href="https://github.com/glzr-io/glazewm">GlazeWM</a> that lives inside the Windows taskbar.</p>
 
 <p align="center">Shows the active workspace and all available workspaces. Nothing else.</p>
 
 ## Features
 
-- One bar per monitor, anchored to any screen edge
+- Renders *inside* the native taskbar — one widget per monitor's taskbar
 - Active workspace highlighted with a filled pill
+- Per-pixel alpha over the taskbar; fully click-through
 - Connects to GlazeWM over WebSocket and reacts to workspace events in real time
-- Reconnects automatically if GlazeWM restarts
+- Reconnects automatically if GlazeWM restarts; re-embeds automatically if Explorer restarts
+- No polling: fullscreen apps, auto-hide and z-order are handled by the shell itself
 - Pure Rust — no WebView, no JS runtime, no system font dependency
-- Transparent window background support on both Windows and macOS
-- ~3 MB release binary (LTO + stripped)
+- ~2 MB release binary (LTO + stripped)
 
 ## Requirements
 
 - [GlazeWM](https://github.com/glzr-io/glazewm) running on the same machine
-- Windows or macOS
+- Windows 10 or 11
+
+> glazeid 0.8+ is Windows-only. The last release with macOS support (as an
+> overlay bar) is v0.7.0 — `cargo install glazeid --version 0.7.0`. Its source
+> lives on the `backup/v0.7.0-overlay` branch.
 
 ## Installation
 
@@ -43,7 +48,12 @@ Start glazeid after GlazeWM is running:
 glazeid
 ```
 
-glazeid connects to GlazeWM on `127.0.0.1:6123` and creates a bar on each monitor. It reconnects automatically if the connection drops.
+glazeid connects to GlazeWM on `127.0.0.1:6123` and embeds a widget into the
+taskbar of every monitor that has one (the primary taskbar, plus secondary
+taskbars when "show my taskbar on all displays" is enabled). It reconnects
+automatically if the connection drops.
+
+Quit via the tray icon menu.
 
 Set `RUST_LOG=debug` for verbose output:
 
@@ -55,32 +65,27 @@ RUST_LOG=debug glazeid
 
 glazeid looks for a config file at:
 
-| Platform | Path |
-|----------|------|
-| macOS    | `~/.config/.glzr/glazeid/config.yaml` |
-| Windows  | `%USERPROFILE%\.glzr\glazeid\config.yaml` |
+```
+%USERPROFILE%\.glzr\glazeid\config.yaml
+```
 
-If the file does not exist, glazeid starts with the built-in defaults. No error is thrown for a missing file — only for a file that exists but cannot be parsed.
+If the file does not exist — or is empty — glazeid starts with the built-in
+defaults. An error is thrown only for a file that exists but cannot be parsed.
+Unknown keys (e.g. options from glazeid 0.7.x such as `position`) are ignored,
+so an old config keeps working.
 
-A ready-to-use sample config with all options and their defaults is provided at [`resources/config.sample.yaml`](resources/config.sample.yaml). Copy it to the path above and edit as needed.
+A ready-to-use sample config with all options and their defaults is provided
+at [`resources/config.sample.yaml`](resources/config.sample.yaml). Copy it to
+the path above and edit as needed.
 
 ### All options
 
 ```yaml
-# Which screen edge the bar docks to.
-# Values: "top" | "bottom"
-position: "bottom"
-
-# How far along the edge to place the bar, as a percentage of monitor width.
-# 0.0 = left-most (default), 50.0 = centred, 100.0 = right edge.
+# How far along the taskbar to place the widget, as a percentage of the
+# taskbar's width. 0.0 = left edge (default), 50.0 = centred, 100.0 = flush
+# with the right edge. Clamped so the widget always stays fully on the
+# taskbar. The widget is always centred vertically inside the taskbar.
 offset_percent: 0.0
-
-# Windows only (ignored on macOS).
-# How far the bar sits from the edge it docks to, in logical pixels.
-# 0.0 = flush with the edge (default). Larger values move the bar inwards:
-# down from the top edge, or up from the bottom edge. Use this to centre the
-# bar vertically inside the taskbar.
-windows_edge_offset: 0.0
 
 # GlazeWM WebSocket IPC port.
 glazewm_port: 6123
@@ -88,7 +93,8 @@ glazewm_port: 6123
 # Milliseconds to wait before retrying a failed IPC connection.
 reconnect_delay_ms: 2000
 
-# Bar background color. Use "#rrggbbaa" for transparency, e.g. "#00000000" = fully transparent.
+# Widget background color. Use "#rrggbbaa" for transparency.
+# The default is fully transparent, so only the workspace pills are visible.
 background: "#00000000"
 
 # Text color for inactive workspace labels.
@@ -107,7 +113,7 @@ font_size: 13.0
 label_padding_x: 10.0
 
 # Vertical padding above and below the text, in logical pixels.
-# Total bar height = font cap-height + 2 × label_padding_y.
+# Total widget height = font cap-height + 2 × label_padding_y.
 label_padding_y: 4.0
 
 # Corner radius of the active workspace pill, in logical pixels.
@@ -120,22 +126,20 @@ Colors are hex strings: `"#rrggbb"` (fully opaque) or `"#rrggbbaa"` (with alpha)
 
 | Layer | Technology |
 |-------|------------|
-| OS window | `winit` — one decoration-free, always-on-top window per monitor |
-| Rendering (Windows) | `softbuffer` — CPU framebuffer, no GPU required |
-| Rendering (macOS) | Custom `CGImage` surface with premultiplied alpha for true transparency |
+| Window | Raw Win32 layered child window, embedded via `SetParent` into `Shell_TrayWnd` / `Shell_SecondaryTrayWnd` |
 | Drawing | `tiny_skia` — fills background, draws rounded-rect pills |
 | Text | `fontdue` — rasterizes the embedded JetBrains Mono TTF |
+| Presentation | 32-bpp premultiplied DIB section + `UpdateLayeredWindow` (per-pixel alpha) |
 | IPC | `tokio-tungstenite` — WebSocket client to GlazeWM on port 6123 |
-| State | `tokio::sync::watch` — IPC task pushes updates; bar redraws only on change |
-| Z-order (Windows) | 1s tick — keeps the bar above the taskbar and hides it under fullscreen apps |
+| State | `tokio::sync::watch` + `PostMessage` — the IPC task wakes the Win32 message loop only on change |
+| Explorer restarts | `TaskbarCreated` broadcast → widgets are re-embedded |
 
-On Windows the taskbar is itself a topmost window, so the bar has to be topmost
-too in order to draw over it. Topmost is a band rather than a fixed position,
-though: the shell pushes the taskbar back to the front of that band whenever an
-app goes fullscreen, and never lowers it again. The bar therefore re-checks its
-z-order once a second and reclaims its place, and hides itself while a
-fullscreen window covers its monitor. The check is cheap enough not to register
-on the process CPU time.
+Because the widget is a child window of the taskbar itself, the shell handles
+everything the old overlay implementation (v0.7.x) had to fight for by hand:
+no topmost z-order battles, no fullscreen detection, no 1-second polling tick.
+When the taskbar hides, moves or dies, the widget follows it. Pixels with
+alpha 0 are hit-test transparent and the rest is `WS_EX_TRANSPARENT`, so the
+widget never intercepts taskbar input.
 
 ## License
 

@@ -1,554 +1,204 @@
-/// glazeid — a minimal GlazeWM workspace bar.
+/// glazeid — a minimal GlazeWM workspace widget embedded in the Windows
+/// taskbar.
 ///
-/// One window is created per monitor.  Its size is driven entirely by content:
-/// width = sum of all workspace pill widths, height = cap-height + vertical
-/// padding.  Placement is controlled by `position` (top/bottom) and
-/// `offset_percent` (how far along the edge from the left, 0 = left-most).
+/// One bar window is created per monitor and parented *into* that monitor's
+/// taskbar (`Shell_TrayWnd` / `Shell_SecondaryTrayWnd`), so the shell manages
+/// visibility: fullscreen apps, auto-hide and z-order all behave correctly
+/// without the polling the old overlay implementation needed.
 ///
 /// A background tokio task maintains a WebSocket connection to GlazeWM and
-/// publishes `BarState` updates through a `watch` channel.  The winit event
-/// loop wakes on a `UserEvent` and redraws + repositions windows only when
-/// state has changed.
-///
-/// Window placement uses the monitor geometry reported by GlazeWM (logical
-/// pixels) rather than winit's `monitor.size()`, which can return inflated
-/// physical pixel counts on HiDPI displays — especially on macOS.
+/// publishes `BarState` updates through a `watch` channel; a hidden
+/// message-handling window is woken via `PostMessage` and syncs the bar
+/// windows on the main thread. The same hidden window receives the
+/// `TaskbarCreated` broadcast and re-embeds every bar when Explorer restarts.
+#[cfg(not(target_os = "windows"))]
+compile_error!(
+    "glazeid 0.8+ is Windows-only. For the macOS/overlay version use v0.7.x \
+     (branch backup/v0.7.0-overlay)."
+);
+
+mod bar;
 mod client;
 mod config;
 mod ipc;
 mod renderer;
 mod sys_tray;
+mod taskbar;
 
-#[cfg(target_os = "macos")]
-mod macos_surface;
-
-#[cfg(target_os = "windows")]
-mod win_zorder;
-
+use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
-use anyhow::Result;
-use client::{BarState, MonitorGeometry, MonitorWorkspaces, WorkspaceInfo};
-use config::{BarPosition, Config};
-use renderer::{ContentSize, Renderer};
+use anyhow::{bail, Context, Result};
+use bar::BarWindow;
+use client::BarState;
+use config::Config;
+use renderer::Renderer;
 use sys_tray::Tray;
+use taskbar::wide;
 use tokio::sync::watch;
 use tray_icon::menu::MenuEvent;
-#[cfg(not(target_os = "windows"))]
-use winit::dpi::{LogicalPosition, LogicalSize};
-use winit::{
-    application::ApplicationHandler,
-    event::WindowEvent,
-    event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
-    window::{Window, WindowId, WindowLevel},
+
+use windows_sys::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::UI::HiDpi::{
+    SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, PostMessageW,
+    PostQuitMessage, RegisterClassW, RegisterWindowMessageW, TranslateMessage, MSG, WM_APP,
+    WNDCLASSW,
 };
 
-// softbuffer is only used on non-macOS platforms
-#[cfg(not(target_os = "macos"))]
-use softbuffer::{Context as SbContext, Surface};
-#[cfg(not(target_os = "macos"))]
-use std::num::NonZeroU32;
-#[cfg(target_os = "windows")]
-use winit::dpi::{PhysicalPosition, PhysicalSize};
+/// Posted by the IPC watch task whenever `BarState` changes.
+const WM_APP_STATE_CHANGED: u32 = WM_APP + 1;
 
-// ---------------------------------------------------------------------------
-// User events (IPC → winit)
-// ---------------------------------------------------------------------------
+/// Registered message broadcast by the shell when the taskbar is (re)created.
+static TASKBAR_CREATED_MSG: AtomicU32 = AtomicU32::new(0);
 
-/// Sent by the IPC watch task whenever the `BarState` changes.
-#[derive(Debug)]
-struct StateChanged;
-
-/// How often the bar re-checks its z-order on Windows. Slow enough to be free
-/// in practice, quick enough that the bar cannot stay buried for long.
-#[cfg(target_os = "windows")]
-const Z_ORDER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
-
-// ---------------------------------------------------------------------------
-// Platform-abstracted rendering surface
-// ---------------------------------------------------------------------------
-
-enum BarSurface {
-    #[cfg(target_os = "macos")]
-    Macos(macos_surface::MacosSurface),
-    #[cfg(not(target_os = "macos"))]
-    Softbuffer(Surface<Arc<Window>, Arc<Window>>),
-}
-
-impl BarSurface {
-    /// Render into the surface and present. Returns false on error.
-    fn render_and_present(
-        &mut self,
-        w: u32,
-        h: u32,
-        scale: f32,
-        workspaces: &[WorkspaceInfo],
-        cfg: &Config,
-        renderer: &Renderer,
-    ) -> bool {
-        match self {
-            #[cfg(target_os = "macos")]
-            BarSurface::Macos(s) => {
-                s.resize(w, h);
-                renderer.render(s.pixels_mut(), w, h, scale, workspaces, cfg);
-                s.present();
-                true
-            }
-            #[cfg(not(target_os = "macos"))]
-            BarSurface::Softbuffer(s) => {
-                if s.resize(NonZeroU32::new(w).unwrap(), NonZeroU32::new(h).unwrap())
-                    .is_err()
-                {
-                    return false;
-                }
-                match s.buffer_mut() {
-                    Ok(mut buf) => {
-                        renderer.render(&mut buf, w, h, scale, workspaces, cfg);
-                        buf.present().is_ok()
-                    }
-                    Err(_) => false,
-                }
-            }
-        }
-    }
+thread_local! {
+    /// Owned by the main thread; accessed from the message window's wndproc.
+    static APP: RefCell<Option<App>> = const { RefCell::new(None) };
 }
 
 // ---------------------------------------------------------------------------
-// Per-bar-window state
-// ---------------------------------------------------------------------------
-
-struct BarWindow {
-    window: Arc<Window>,
-    surface: BarSurface,
-    /// GlazeWM `device_name` of the monitor this bar lives on.
-    device_name: String,
-    /// Scale factor reported by GlazeWM for this monitor.
-    scale_factor: f32,
-    /// Last rendered content size (physical px) — used to skip redundant resizes.
-    last_size: ContentSize,
-}
-
-// ---------------------------------------------------------------------------
-// Application
+// Application state
 // ---------------------------------------------------------------------------
 
 struct App {
     cfg: Config,
     renderer: Renderer,
     state_rx: watch::Receiver<BarState>,
-    #[allow(dead_code)]
-    proxy: EventLoopProxy<StateChanged>,
-    bars: HashMap<WindowId, BarWindow>,
-    #[cfg(not(target_os = "macos"))]
-    sb_ctx: Option<SbContext<Arc<Window>>>,
-    dirty: bool,
-    /// Tray icon — installed once on first `resumed`, kept alive for its Drop.
-    tray: Option<Tray>,
-    /// Whether windows have been created yet. We defer creation until the first
-    /// real IPC state arrives so that we have valid geometry and workspace data.
-    windows_created: bool,
+    /// Bar windows keyed by GlazeWM monitor `device_name`.
+    bars: HashMap<String, BarWindow>,
 }
 
 impl App {
-    fn new(
-        cfg: Config,
-        state_rx: watch::Receiver<BarState>,
-        proxy: EventLoopProxy<StateChanged>,
-    ) -> Self {
-        Self {
-            cfg,
-            renderer: Renderer::new(),
-            state_rx,
-            proxy,
-            bars: HashMap::new(),
-            #[cfg(not(target_os = "macos"))]
-            sb_ctx: None,
-            dirty: false,
-            tray: None,
-            windows_created: false,
-        }
-    }
-
-    /// Create one bar window per monitor reported by GlazeWM.
-    fn create_windows(&mut self, event_loop: &ActiveEventLoop) {
-        let state = self.state_rx.borrow().clone();
-
-        if state.monitors.is_empty() {
-            tracing::warn!("No monitors in GlazeWM state; skipping window creation.");
-            return;
-        }
-
-        tracing::info!(
-            "Creating bar windows for {} monitor(s) from GlazeWM state.",
-            state.monitors.len()
-        );
-
-        let device_names: Vec<String> = state.monitors.keys().cloned().collect();
-        for device_name in device_names {
-            let mw = state.monitors.get(&device_name).unwrap();
-            if let Err(e) = self.create_bar_for_glazewm_monitor(
-                event_loop,
-                &device_name,
-                &mw.geometry,
-                &mw.workspaces,
-            ) {
-                tracing::warn!("Failed to create bar for monitor {device_name}: {e:#}");
-            }
-        }
-
-        self.windows_created = true;
-    }
-
-    fn create_bar_for_glazewm_monitor(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        device_name: &str,
-        geo: &MonitorGeometry,
-        workspaces: &[WorkspaceInfo],
-    ) -> Result<()> {
-        let scale = geo.scale_factor;
-        let content = self.renderer.measure(workspaces, &self.cfg, scale);
-
-        let (win_x, win_y) = bar_position_logical(&self.cfg, geo, content, scale);
-
-        tracing::debug!(
-            device_name,
-            scale,
-            geo_x = geo.x,
-            geo_y = geo.y,
-            geo_w = geo.width,
-            geo_h = geo.height,
-            win_x,
-            win_y,
-            content_w = content.width,
-            content_h = content.height,
-            "Creating bar window."
-        );
-
-        // GlazeWM reports monitor geometry in physical pixels on Windows and
-        // logical pixels on macOS. Use the matching winit coordinate type so
-        // the window lands in the right place on both platforms.
-        #[allow(unused_mut)]
-        let mut attrs = {
-            #[cfg(target_os = "windows")]
-            {
-                Window::default_attributes()
-                    .with_title("glazeid")
-                    .with_decorations(false)
-                    .with_resizable(false)
-                    .with_transparent(true)
-                    // The taskbar is itself WS_EX_TOPMOST, so the bar has to be
-                    // topmost as well in order to draw above it.
-                    .with_window_level(WindowLevel::AlwaysOnTop)
-                    .with_position(PhysicalPosition::new(win_x as i32, win_y as i32))
-                    .with_inner_size(PhysicalSize::new(
-                        content.width.max(1),
-                        content.height.max(1),
-                    ))
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                let logical_w = (content.width as f32 / scale).ceil() as u32;
-                let logical_h = (content.height as f32 / scale).ceil() as u32;
-                Window::default_attributes()
-                    .with_title("glazeid")
-                    .with_decorations(false)
-                    .with_resizable(false)
-                    .with_transparent(true)
-                    .with_window_level(WindowLevel::AlwaysOnTop)
-                    .with_position(LogicalPosition::new(win_x, win_y))
-                    .with_inner_size(LogicalSize::new(logical_w.max(1), logical_h.max(1)))
-            }
-        };
-
-        #[cfg(target_os = "windows")]
-        {
-            use winit::platform::windows::WindowAttributesExtWindows;
-            attrs = attrs.with_skip_taskbar(true);
-        }
-
-        let window = Arc::new(event_loop.create_window(attrs)?);
-
-        // On macOS, raise the window above the menu bar and reposition if needed.
-        #[cfg(target_os = "macos")]
-        if self.cfg.position == config::BarPosition::Top {
-            let menubar_h = macos_raise_above_menubar(&window);
-            // Shift the window up by the menu bar height so it overlaps the menu bar.
-            let new_y = win_y - menubar_h;
-            window.set_outer_position(LogicalPosition::new(win_x, new_y));
-        }
-
-        // Build the platform-specific surface.
-        let surface = {
-            #[cfg(target_os = "macos")]
-            {
-                let s = macos_surface::MacosSurface::new(&window)
-                    .ok_or_else(|| anyhow::anyhow!("Failed to create macOS surface"))?;
-                BarSurface::Macos(s)
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                let ctx = self.sb_ctx.get_or_insert_with(|| {
-                    SbContext::new(window.clone()).expect("softbuffer context")
-                });
-                let mut s = Surface::new(ctx, window.clone()).expect("softbuffer surface");
-                s.resize(
-                    NonZeroU32::new(content.width.max(1)).unwrap(),
-                    NonZeroU32::new(content.height.max(1)).unwrap(),
-                )
-                .ok();
-                BarSurface::Softbuffer(s)
-            }
-        };
-
-        let id = window.id();
-        self.bars.insert(
-            id,
-            BarWindow {
-                window,
-                surface,
-                device_name: device_name.to_string(),
-                scale_factor: scale,
-                last_size: content,
-            },
-        );
-
-        Ok(())
-    }
-
-    /// Keep each bar in the right place in the z-order.
-    ///
-    /// Runs once per `Z_ORDER_INTERVAL` because the shell silently raises the
-    /// taskbar above the bar whenever an app goes fullscreen; see `win_zorder`
-    /// for the measurements.
-    #[cfg(target_os = "windows")]
-    fn apply_z_order(&mut self) {
-        for bar in self.bars.values() {
-            let fullscreen = win_zorder::monitor_is_fullscreen(&bar.window);
-
-            // Hide under fullscreen apps. Comparing against the real window
-            // state means a request the system ignored is retried next tick.
-            if fullscreen != win_zorder::is_hidden(&bar.window) {
-                win_zorder::set_hidden(&bar.window, fullscreen);
-            }
-
-            // Otherwise make sure the taskbar has not crept in front of us.
-            // Checking first avoids a SetWindowPos on every single tick.
-            if !fullscreen && win_zorder::taskbar_is_above(&bar.window) {
-                win_zorder::raise_to_front(&bar.window);
-            }
-        }
-    }
-
-    /// Redraw every bar window, resizing and repositioning as needed.
-    fn redraw_all(&mut self) {
+    /// Bring the bar windows in line with the latest GlazeWM state: drop bars
+    /// for dead windows/monitors, create missing ones, redraw the rest.
+    fn sync_bars(&mut self) {
         let state = self.state_rx.borrow_and_update().clone();
-        let empty = MonitorWorkspaces::default();
-        let ids: Vec<WindowId> = self.bars.keys().copied().collect();
 
-        for id in ids {
-            let bar = self.bars.get_mut(&id).unwrap();
-            let mw = state.monitors.get(&bar.device_name).unwrap_or(&empty);
-            redraw_bar(bar, &mw.workspaces, &mw.geometry, &self.cfg, &self.renderer);
-        }
-
-        self.dirty = false;
-    }
-}
-
-/// Render a single bar window, resizing and repositioning the OS window when
-/// the content size has changed.
-fn redraw_bar(
-    bar: &mut BarWindow,
-    workspaces: &[WorkspaceInfo],
-    geo: &MonitorGeometry,
-    cfg: &Config,
-    renderer: &Renderer,
-) {
-    let scale = bar.scale_factor;
-    let content = renderer.measure(workspaces, cfg, scale);
-
-    if content != bar.last_size {
-        let (win_x, win_y) = bar_position_logical(cfg, geo, content, scale);
-
-        #[cfg(target_os = "windows")]
-        {
-            bar.window
-                .set_outer_position(PhysicalPosition::new(win_x as i32, win_y as i32));
-            let _ = bar.window.request_inner_size(PhysicalSize::new(
-                content.width.max(1),
-                content.height.max(1),
-            ));
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let logical_w = (content.width as f32 / scale).ceil() as u32;
-            let logical_h = (content.height as f32 / scale).ceil() as u32;
-            bar.window
-                .set_outer_position(LogicalPosition::new(win_x, win_y));
-            let _ = bar
-                .window
-                .request_inner_size(LogicalSize::new(logical_w.max(1), logical_h.max(1)));
-        }
-
-        bar.last_size = content;
-    }
-
-    let w = content.width.max(1);
-    let h = content.height.max(1);
-
-    bar.surface
-        .render_and_present(w, h, scale, workspaces, cfg, renderer);
-}
-
-// ---------------------------------------------------------------------------
-// winit ApplicationHandler impl
-// ---------------------------------------------------------------------------
-
-impl ApplicationHandler<StateChanged> for App {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        // Set the app icon here — NSApp is guaranteed to be ready once the
-        // event loop has started and resumed is called.
-        #[cfg(target_os = "macos")]
-        set_macos_app_icon();
-
-        if self.tray.is_none() {
-            // Determine if it should be hidden based on OS and config
-            let is_macos = cfg!(target_os = "macos");
-            let should_hide = is_macos && self.cfg.macos_trayicon_hidden;
-
-            match Tray::new(should_hide) {
-                Ok(Some(t)) => self.tray = Some(t),
-                Ok(None) => tracing::info!("Tray icon disabled by config"),
-                Err(e) => tracing::warn!("Failed to create tray icon: {e:#}"),
+        self.bars.retain(|dev, bar| {
+            if !bar.is_alive() {
+                tracing::info!("Bar on {dev} died (taskbar gone?); dropping it.");
+                return false;
             }
-        }
-
-        if !self.windows_created {
-            let has_monitors = !self.state_rx.borrow().monitors.is_empty();
-            if has_monitors {
-                self.create_windows(event_loop);
-                self.dirty = true;
+            if !state.monitors.contains_key(dev) {
+                tracing::info!("Monitor {dev} no longer reported by GlazeWM; dropping bar.");
+                return false;
             }
-        }
-    }
+            true
+        });
 
-    fn window_event(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        window_id: WindowId,
-        event: WindowEvent,
-    ) {
-        match event {
-            WindowEvent::CloseRequested => {
-                event_loop.exit();
-            }
-            WindowEvent::RedrawRequested => {
-                if let Some(bar) = self.bars.get_mut(&window_id) {
-                    let state = self.state_rx.borrow();
-                    let empty = MonitorWorkspaces::default();
-                    let mw = state.monitors.get(&bar.device_name).unwrap_or(&empty);
-                    let workspaces = mw.workspaces.clone();
-                    let geo = mw.geometry.clone();
-                    drop(state);
-                    redraw_bar(bar, &workspaces, &geo, &self.cfg, &self.renderer);
+        for (dev, mw) in &state.monitors {
+            if !self.bars.contains_key(dev) {
+                let Some(tb) = taskbar::for_monitor(dev, &mw.geometry) else {
+                    tracing::debug!("Monitor {dev} has no taskbar; skipping.");
+                    continue;
+                };
+                match BarWindow::create(&tb, mw.geometry.scale_factor) {
+                    Ok(b) => {
+                        tracing::info!("Embedded bar into taskbar on {dev}.");
+                        self.bars.insert(dev.clone(), b);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to embed bar on {dev}: {e:#}");
+                        continue;
+                    }
                 }
             }
-            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                if let Some(bar) = self.bars.get_mut(&window_id) {
-                    bar.scale_factor = scale_factor as f32;
-                    bar.last_size = ContentSize {
-                        width: 0,
-                        height: 0,
-                    };
-                }
-                self.dirty = true;
+
+            if let Some(b) = self.bars.get_mut(dev) {
+                b.scale = mw.geometry.scale_factor;
+                b.redraw(&mw.workspaces, &self.cfg, &self.renderer);
             }
-            _ => {}
         }
     }
 
-    fn user_event(&mut self, event_loop: &ActiveEventLoop, _event: StateChanged) {
-        if !self.windows_created {
-            self.create_windows(event_loop);
-        }
-        self.dirty = true;
-        self.redraw_all();
-    }
-
-    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if let Some(tray) = &self.tray {
-            while let Ok(event) = MenuEvent::receiver().try_recv() {
-                if event.id == tray.quit_id {
-                    event_loop.exit();
-                }
-            }
-        }
-
-        if self.dirty {
-            self.redraw_all();
-        }
-
-        // Re-check the z-order on a slow tick and go back to sleep until the
-        // next one. This is the only reason the event loop wakes on its own.
-        #[cfg(target_os = "windows")]
-        {
-            self.apply_z_order();
-            event_loop.set_control_flow(ControlFlow::WaitUntil(
-                std::time::Instant::now() + Z_ORDER_INTERVAL,
-            ));
-        }
+    /// Explorer restarted: every bar window died with the old taskbar.
+    fn reembed_all(&mut self) {
+        tracing::info!("Taskbar (re)created; re-embedding all bars.");
+        self.bars.clear();
+        self.sync_bars();
     }
 }
 
 // ---------------------------------------------------------------------------
-// Geometry helpers
+// Hidden message window
 // ---------------------------------------------------------------------------
 
-/// Compute the (x, y) bar origin in the same coordinate space GlazeWM uses.
-///
-/// On macOS: GlazeWM reports logical pixels → divide content (physical) by
-///           scale to get logical content size for offset math.
-/// On Windows: GlazeWM reports physical pixels → content is already physical,
-///             no division needed.
-fn bar_position_logical(
-    cfg: &Config,
-    geo: &MonitorGeometry,
-    content: ContentSize,
-    scale: f32,
-) -> (f32, f32) {
-    // On Windows GlazeWM coordinates are physical; on macOS they are logical.
-    #[cfg(target_os = "windows")]
-    let (content_w, content_h) = (content.width as f32, content.height as f32);
-    #[cfg(not(target_os = "windows"))]
-    let (content_w, content_h) = (content.width as f32 / scale, content.height as f32 / scale);
+fn create_message_window() -> Result<HWND> {
+    unsafe {
+        let class = wide("glazeid_msg");
 
-    let monitor_w = geo.width as f32;
-    let monitor_h = geo.height as f32;
+        let mut wc: WNDCLASSW = std::mem::zeroed();
+        wc.lpfnWndProc = Some(msg_wndproc);
+        wc.hInstance = GetModuleHandleW(std::ptr::null());
+        wc.lpszClassName = class.as_ptr();
+        if RegisterClassW(&wc) == 0 {
+            bail!("RegisterClassW(glazeid_msg) failed (error {})", GetLastError());
+        }
 
-    // Distance along the docked edge.
-    let along_edge = (monitor_w * cfg.offset_percent / 100.0)
-        .min(monitor_w - content_w)
-        .max(0.0);
+        // A real (never-shown) top-level window rather than a message-only
+        // window: message-only windows do not receive broadcasts such as
+        // TaskbarCreated.
+        let hwnd = CreateWindowExW(
+            0,
+            class.as_ptr(),
+            class.as_ptr(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            GetModuleHandleW(std::ptr::null()),
+            std::ptr::null(),
+        );
+        if hwnd.is_null() {
+            bail!("CreateWindowExW(glazeid_msg) failed (error {})", GetLastError());
+        }
+        Ok(hwnd)
+    }
+}
 
-    // Distance inwards from the docked edge. Windows only — macOS keeps the bar
-    // flush with the edge, since placement there also has to account for the
-    // menu bar. Config lengths are logical pixels and GlazeWM reports physical
-    // ones on Windows, so scale it; clamp so the bar stays on the monitor.
-    #[cfg(target_os = "windows")]
-    let from_edge =
-        (cfg.windows_edge_offset * scale).clamp(0.0, (monitor_h - content_h).max(0.0));
-    #[cfg(not(target_os = "windows"))]
-    let from_edge = 0.0_f32;
+unsafe extern "system" fn msg_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if msg == WM_APP_STATE_CHANGED {
+        dispatch_app(hwnd, msg, App::sync_bars);
+        return 0;
+    }
 
-    let x = geo.x as f32 + along_edge;
-    let y = match cfg.position {
-        BarPosition::Top => geo.y as f32 + from_edge,
-        BarPosition::Bottom => geo.y as f32 + monitor_h - content_h - from_edge,
-    };
+    let taskbar_created = TASKBAR_CREATED_MSG.load(Ordering::Relaxed);
+    if taskbar_created != 0 && msg == taskbar_created {
+        dispatch_app(hwnd, msg, App::reembed_all);
+        return 0;
+    }
 
-    (x, y)
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+/// Run `f` against the shared `App`, retrying via `PostMessage` if the
+/// wndproc re-entered while the app was already borrowed (possible when a
+/// broadcast is delivered during a blocking cross-process call such as
+/// `SetParent`).
+fn dispatch_app(hwnd: HWND, msg: u32, f: impl FnOnce(&mut App)) {
+    APP.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut guard) => {
+            if let Some(app) = guard.as_mut() {
+                f(app);
+            }
+        }
+        Err(_) => {
+            unsafe { PostMessageW(hwnd, msg, 0, 0) };
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -564,120 +214,96 @@ fn main() -> Result<()> {
 
     let cfg = Config::load()?;
 
+    // Match the taskbar's per-monitor DPI awareness so all window coordinates
+    // are true physical pixels (the space GlazeWM reports in).
+    unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
         .enable_all()
-        .build()?;
+        .build()
+        .context("Failed to build tokio runtime")?;
+    let _rt_guard = rt.enter();
 
-    #[allow(unused_mut)]
-    let mut event_loop_builder = EventLoop::<StateChanged>::with_user_event();
+    let msg_hwnd = create_message_window()?;
+    TASKBAR_CREATED_MSG.store(
+        unsafe { RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()) },
+        Ordering::Relaxed,
+    );
 
-    #[cfg(target_os = "macos")]
-    {
-        use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
-        event_loop_builder.with_activation_policy(ActivationPolicy::Accessory);
-    }
+    let state_rx = client::spawn(cfg.glazewm_port, cfg.reconnect_delay_ms);
+    spawn_state_watcher(state_rx.clone(), msg_hwnd);
 
-    let event_loop = event_loop_builder.build()?;
-    event_loop.set_control_flow(ControlFlow::Wait);
+    let tray = match Tray::new() {
+        Ok(t) => Some(t),
+        Err(e) => {
+            tracing::warn!("Failed to create tray icon: {e:#}");
+            None
+        }
+    };
 
-    let proxy = event_loop.create_proxy();
-    let state_rx = rt.block_on(async { spawn_ipc_watcher(&cfg, proxy.clone()) });
+    APP.with(|cell| {
+        *cell.borrow_mut() = Some(App {
+            cfg,
+            renderer: Renderer::new(),
+            state_rx,
+            bars: HashMap::new(),
+        });
+    });
 
-    let mut app = App::new(cfg, state_rx, proxy);
-    event_loop.run_app(&mut app)?;
+    tracing::info!("glazeid running as a taskbar widget.");
 
-    Ok(())
-}
+    // Win32 message loop. Blocks in GetMessageW; woken by window messages,
+    // the IPC watcher's PostMessage, and tray menu interaction.
+    unsafe {
+        let mut msg: MSG = std::mem::zeroed();
+        loop {
+            match GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) {
+                0 => break, // WM_QUIT
+                -1 => {
+                    tracing::error!("GetMessageW failed (error {}).", GetLastError());
+                    break;
+                }
+                _ => {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
 
-/// Raise the window to `NSStatusWindowLevel` (above the menu bar) and return
-/// the menu bar height in logical pixels so the caller can shift `y` up.
-///
-/// `NSMainMenuWindowLevel = 24`, `NSStatusWindowLevel = 25` — placing at 25
-/// puts the window in the same Z-layer as menu bar extras (clock, wifi, etc.).
-#[cfg(target_os = "macos")]
-fn macos_raise_above_menubar(window: &Window) -> f32 {
-    use objc2::msg_send;
-    use objc2::MainThreadMarker;
-    use objc2_app_kit::{NSScreen, NSStatusWindowLevel};
-    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-
-    // Raise the NSWindow level above the menu bar.
-    if let Ok(handle) = window.window_handle() {
-        if let RawWindowHandle::AppKit(h) = handle.as_raw() {
-            unsafe {
-                let view: *mut objc2::runtime::AnyObject = h.ns_view.as_ptr().cast();
-                let ns_window: *mut objc2::runtime::AnyObject = msg_send![view, window];
-                if !ns_window.is_null() {
-                    // NSStatusWindowLevel = 25, one above NSMainMenuWindowLevel = 24.
-                    let _: () = msg_send![ns_window, setLevel: NSStatusWindowLevel];
+            // Tray menu events surface after their messages are dispatched.
+            if let Some(tray) = &tray {
+                while let Ok(event) = MenuEvent::receiver().try_recv() {
+                    if event.id == tray.quit_id {
+                        tracing::info!("Quit requested from tray menu.");
+                        PostQuitMessage(0);
+                    }
                 }
             }
         }
     }
 
-    // Return the menu bar height (logical px) from the main screen.
-    if let Some(mtm) = MainThreadMarker::new() {
-        if let Some(screen) = NSScreen::mainScreen(mtm) {
-            let full_h = screen.frame().size.height as f32;
-            let visible_frame = screen.visibleFrame();
-            let visible_h = visible_frame.size.height as f32;
-            // visibleFrame.origin.y = dock height (0 if dock is on side or hidden).
-            let dock_h = visible_frame.origin.y as f32;
-            let menubar_h = full_h - visible_h - dock_h;
-            tracing::debug!("macOS menu bar height: {menubar_h} logical px");
-            return menubar_h;
-        }
-    }
+    // Destroy bar windows (BarWindow::drop) before the runtime shuts down.
+    APP.with(|cell| cell.borrow_mut().take());
+    drop(tray);
+    unsafe { DestroyWindow(msg_hwnd) };
 
-    24.0 // sensible fallback
+    Ok(())
 }
 
-/// Set the macOS application icon from the embedded PNG so it appears in
-/// Activity Monitor and the Force Quit dialog.
-///
-/// Plain binaries (not .app bundles) have no Info.plist/icns, so the icon
-/// must be set programmatically via NSApp.
-#[cfg(target_os = "macos")]
-fn set_macos_app_icon() {
-    use objc2::AnyThread;
-    use objc2::MainThreadMarker;
-    use objc2_app_kit::{NSApplication, NSImage};
-    use objc2_foundation::NSData;
-
-    const LOGO_PNG: &[u8] = include_bytes!("../resources/glazeid.png");
-
-    let Some(mtm) = MainThreadMarker::new() else {
-        return;
-    };
-
-    unsafe {
-        let data = NSData::with_bytes(LOGO_PNG);
-        let Some(image) = NSImage::initWithData(NSImage::alloc(), &data) else {
-            return;
-        };
-        let app = NSApplication::sharedApplication(mtm);
-        app.setApplicationIconImage(Some(&image));
-    }
-}
-
-fn spawn_ipc_watcher(
-    cfg: &Config,
-    proxy: EventLoopProxy<StateChanged>,
-) -> watch::Receiver<BarState> {
-    let rx = client::spawn(cfg.glazewm_port, cfg.reconnect_delay_ms);
-    let mut watcher_rx = rx.clone();
-
+/// Forward `watch` channel updates to the message window as posted messages.
+fn spawn_state_watcher(mut rx: watch::Receiver<BarState>, msg_hwnd: HWND) {
+    // HWND is a raw pointer and not `Send`; the numeric value is fine to move.
+    let hwnd = msg_hwnd as usize;
     tokio::spawn(async move {
+        // Cover any state that arrived before this task started.
+        unsafe { PostMessageW(hwnd as HWND, WM_APP_STATE_CHANGED, 0, 0) };
         loop {
-            if watcher_rx.changed().await.is_err() {
-                break;
+            if rx.changed().await.is_err() {
+                break; // IPC task gone; nothing more to forward.
             }
-            if proxy.send_event(StateChanged).is_err() {
-                break;
+            if unsafe { PostMessageW(hwnd as HWND, WM_APP_STATE_CHANGED, 0, 0) } == 0 {
+                break; // Message window destroyed; shutting down.
             }
         }
     });
-
-    rx
 }

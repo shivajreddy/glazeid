@@ -1,27 +1,17 @@
 # glazeid sample configuration
 #
-# Copy this file to the platform-appropriate path and edit as needed:
+# Copy this file to %USERPROFILE%\.glzr\glazeid\config.yaml and edit as
+# needed.
 #
-#   macOS:   ~/.config/.glzr/glazeid/config.yaml
-#   Windows: %USERPROFILE%\.glzr\glazeid\config.yaml
-#
-# All values shown below are the defaults. You only need to include
-# the keys you want to override — omitted keys fall back to these defaults.
+# All values shown below are the defaults. You only need to include the keys
+# you want to override — omitted keys fall back to these defaults. A missing
+# or empty config file is fine too.
 
-# Which screen edge the bar docks to.
-# Values: "top" | "bottom"
-position: "bottom"
-
-# How far along the edge to place the bar, as a percentage of monitor width.
-# 0.0 = left-most (default), 50.0 = centred, 100.0 = right edge.
+# How far along the taskbar to place the widget, as a percentage of the
+# taskbar's width. 0.0 = left edge (default), 50.0 = centred, 100.0 = flush
+# with the right edge. Clamped so the widget always stays fully on the
+# taskbar. The widget is always centred vertically inside the taskbar.
 offset_percent: 0.0
-
-# Windows only (ignored on macOS).
-# How far the bar sits from the edge it docks to, in logical pixels.
-# 0.0 = flush with the edge (default). Larger values move the bar inwards:
-# down from the top edge, or up from the bottom edge. Use this to centre the
-# bar vertically inside the taskbar.
-windows_edge_offset: 0.0
 
 # GlazeWM WebSocket IPC port.
 glazewm_port: 6123
@@ -29,7 +19,8 @@ glazewm_port: 6123
 # Milliseconds to wait before retrying a failed IPC connection.
 reconnect_delay_ms: 2000
 
-# Bar background color. Use "#rrggbbaa" for transparency, e.g. "#00000000" = fully transparent.
+# Widget background color. Use "#rrggbbaa" for transparency.
+# The default is fully transparent, so only the workspace pills are visible.
 background: "#00000000"
 
 # Text color for inactive workspace labels.
@@ -48,7 +39,7 @@ font_size: 13.0
 label_padding_x: 10.0
 
 # Vertical padding above and below the text, in logical pixels.
-# Total bar height = font cap-height + 2 × label_padding_y.
+# Total widget height = font cap-height + 2 × label_padding_y.
 label_padding_y: 4.0
 
 # Corner radius of the active workspace pill, in logical pixels.

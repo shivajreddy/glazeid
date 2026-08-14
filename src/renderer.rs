@@ -1,7 +1,9 @@
 /// Software-rasterized workspace bar renderer.
 ///
 /// Uses `tiny_skia` for 2-D drawing and `fontdue` for CPU font rasterization.
-/// The output is a `Vec<u32>` ARGB pixel buffer suitable for `softbuffer`.
+/// The output is a premultiplied-BGRA `&mut [u32]` pixel buffer
+/// (u32 = 0xAARRGGBB), which is exactly what `UpdateLayeredWindow` expects
+/// from a 32-bpp DIB section with `AC_SRC_ALPHA`.
 use fontdue::{Font, FontSettings};
 use tiny_skia::{Color, FillRule, Paint, PathBuilder, PixmapMut, Rect, Transform};
 
@@ -101,7 +103,7 @@ impl Renderer {
         }
     }
 
-    /// Render the bar into `buffer` (ARGB u32 pixels, row-major).
+    /// Render the bar into `buffer` (premultiplied BGRA u32 pixels, row-major).
     ///
     /// `width` and `height` must match the buffer dimensions exactly (they
     /// should come from a prior [`Renderer::measure`] call scaled to physical
@@ -119,17 +121,11 @@ impl Renderer {
             return;
         }
 
-        // On macOS we reuse a Vec<u32> across frames, so stale anti-aliased
-        // pixels from a previously active pill can bleed through. Zero the
-        // buffer before painting to guarantee a clean slate.
-        // On Windows softbuffer provides a fresh zeroed buffer each frame.
-        #[cfg(target_os = "macos")]
-        buffer.fill(0);
-
         let mut pixmap = PixmapMut::from_bytes(bytemuck_u32_to_u8_mut(buffer), width, height)
             .expect("buffer size matches width × height × 4");
 
-        // Clear to background.
+        // Clear to background. `fill` overwrites every pixel, so a reused
+        // buffer (the DIB section persists across frames) starts clean.
         pixmap.fill(cfg.background.to_skia());
 
         let font_px = cfg.font_size * scale;
@@ -202,32 +198,16 @@ impl Renderer {
         // Drop the pixmap borrow before we touch `buffer` again as u32.
         drop(pixmap);
 
-        // tiny_skia writes premultiplied RGBA bytes [R, G, B, A] into memory.
-        // On little-endian this is u32 = 0xAABBGGRR  (A in high byte, R in low).
-        //
-        // Target formats:
-        //   macOS  (CGImage PremultipliedFirst + ByteOrder32Little):
-        //          expects bytes [B, G, R, A] in memory = u32 0xAARRGGBB
-        //          → keep A, swap R↔B.
-        //
-        //   Windows/Linux (softbuffer 0x00RRGGBB):
-        //          alpha ignored by compositor; strip A, swap R↔B.
+        // tiny_skia writes premultiplied RGBA bytes [R, G, B, A]; on
+        // little-endian that is u32 = 0xAABBGGRR (A high byte, R low).
+        // UpdateLayeredWindow wants premultiplied BGRA bytes [B, G, R, A]
+        // = u32 0xAARRGGBB → keep A, swap R↔B.
         for pixel in buffer.iter_mut() {
             let r = (*pixel) & 0xFF;
             let g = (*pixel >> 8) & 0xFF;
             let b = (*pixel >> 16) & 0xFF;
             let a = (*pixel >> 24) & 0xFF;
-
-            #[cfg(target_os = "macos")]
-            {
-                *pixel = (a << 24) | (r << 16) | (g << 8) | b;
-            }
-
-            #[cfg(not(target_os = "macos"))]
-            {
-                let _ = a;
-                *pixel = (r << 16) | (g << 8) | b;
-            }
+            *pixel = (a << 24) | (r << 16) | (g << 8) | b;
         }
     }
 }
@@ -237,6 +217,9 @@ impl Renderer {
 // ---------------------------------------------------------------------------
 
 /// Blit fontdue-rasterized glyphs onto the pixmap.
+///
+/// Composites in premultiplied space: the destination pixmap is
+/// premultiplied, the glyph coverage is the source alpha.
 fn draw_text(
     pixmap: &mut PixmapMut,
     font: &Font,
@@ -277,12 +260,14 @@ fn draw_text(
                     continue;
                 }
 
+                // Premultiplied "over": src channels are c·a/255, dst is
+                // already premultiplied; alpha composites the same way.
                 let a = alpha as u32;
                 let ia = 255 - a;
                 data[idx] = ((cr as u32 * a + data[idx] as u32 * ia) / 255) as u8;
                 data[idx + 1] = ((cg as u32 * a + data[idx + 1] as u32 * ia) / 255) as u8;
                 data[idx + 2] = ((cb as u32 * a + data[idx + 2] as u32 * ia) / 255) as u8;
-                data[idx + 3] = 255;
+                data[idx + 3] = ((a * 255 + data[idx + 3] as u32 * ia) / 255) as u8;
             }
         }
 
