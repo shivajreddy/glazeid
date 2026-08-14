@@ -234,8 +234,12 @@ fn main() -> Result<()> {
     let state_rx = client::spawn(cfg.glazewm_port, cfg.reconnect_delay_ms);
     spawn_state_watcher(state_rx.clone(), msg_hwnd);
 
-    let tray = match Tray::new() {
-        Ok(t) => Some(t),
+    let tray = match Tray::new(cfg.trayicon_hidden) {
+        Ok(Some(t)) => Some(t),
+        Ok(None) => {
+            tracing::info!("Tray icon hidden by config.");
+            None
+        }
         Err(e) => {
             tracing::warn!("Failed to create tray icon: {e:#}");
             None

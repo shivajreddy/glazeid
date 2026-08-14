@@ -118,6 +118,10 @@ label_padding_y: 4.0
 
 # Corner radius of the active workspace pill, in logical pixels.
 pill_radius: 4.0
+
+# Hide the system tray icon. When hidden, quit glazeid by killing the
+# process: taskkill /IM glazeid.exe /F
+trayicon_hidden: false
 ```
 
 Colors are hex strings: `"#rrggbb"` (fully opaque) or `"#rrggbbaa"` (with alpha).

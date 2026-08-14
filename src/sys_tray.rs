@@ -29,7 +29,13 @@ pub struct Tray {
 impl Tray {
     /// Install the tray icon.  Must be called on the thread that runs the
     /// message loop (required by Win32).
-    pub fn new() -> Result<Self> {
+    ///
+    /// Returns `Ok(None)` when the icon is hidden by config.
+    pub fn new(hidden: bool) -> Result<Option<Self>> {
+        if hidden {
+            return Ok(None);
+        }
+
         let quit_item = MenuItem::new("Quit glazeid", true, None);
         let quit_id = quit_item.id().clone();
 
@@ -44,10 +50,10 @@ impl Tray {
             .with_icon(icon)
             .build()?;
 
-        Ok(Self {
+        Ok(Some(Self {
             _icon: tray,
             quit_id,
-        })
+        }))
     }
 }
 

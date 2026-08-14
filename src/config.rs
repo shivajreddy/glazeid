@@ -84,6 +84,10 @@ pub struct Config {
 
     /// Corner radius of the active workspace pill, in logical pixels.
     pub pill_radius: f32,
+
+    /// Hide the system tray icon. When hidden, quit glazeid by killing the
+    /// process (e.g. `taskkill /IM glazeid.exe /F`).
+    pub trayicon_hidden: bool,
 }
 
 impl Default for Config {
@@ -100,6 +104,7 @@ impl Default for Config {
             label_padding_x: 10.0,
             label_padding_y: 4.0,
             pill_radius: 4.0,
+            trayicon_hidden: false,
         }
     }
 }
