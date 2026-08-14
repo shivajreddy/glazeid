@@ -1,6 +1,6 @@
 [package]
 name = "glazeid"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2021"
 description = "A minimal GlazeWM workspace widget embedded in the Windows taskbar"
 license = "Apache-2.0"
