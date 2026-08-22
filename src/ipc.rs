@@ -45,8 +45,9 @@ pub enum ClientResponseData {
     /// Catch-all for responses we don't consume (e.g. command responses,
     /// which carry payloads like `{"subjectContainerId": ...}`). Must accept
     /// arbitrary JSON — a unit variant would only match `null` and make the
-    /// whole `ServerMessage` fail to parse.
-    Other(serde_json::Value),
+    /// whole `ServerMessage` fail to parse. The value is never read; it only
+    /// exists so deserialization succeeds.
+    Other(#[allow(dead_code)] serde_json::Value),
 }
 
 /// Payload of a `query monitors` response.
