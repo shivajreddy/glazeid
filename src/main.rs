@@ -24,6 +24,7 @@ mod ipc;
 mod renderer;
 mod sys_tray;
 mod taskbar;
+mod theme;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -36,7 +37,7 @@ use config::Config;
 use renderer::Renderer;
 use sys_tray::Tray;
 use taskbar::wide;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tray_icon::menu::MenuEvent;
 
 use windows_sys::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, WPARAM};
@@ -47,7 +48,7 @@ use windows_sys::Win32::UI::HiDpi::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, PostMessageW,
     PostQuitMessage, RegisterClassW, RegisterWindowMessageW, TranslateMessage, MSG, WM_APP,
-    WNDCLASSW,
+    WM_SETTINGCHANGE, WNDCLASSW,
 };
 
 /// Posted by the IPC watch task whenever `BarState` changes.
@@ -69,8 +70,12 @@ struct App {
     cfg: Config,
     renderer: Renderer,
     state_rx: watch::Receiver<BarState>,
+    /// Commands (e.g. `focus --workspace 3`) forwarded to the IPC task.
+    cmd_tx: mpsc::UnboundedSender<String>,
     /// Bar windows keyed by GlazeWM monitor `device_name`.
     bars: HashMap<String, BarWindow>,
+    /// Whether the Windows system theme (taskbar) is currently dark.
+    dark: bool,
 }
 
 impl App {
@@ -111,7 +116,7 @@ impl App {
 
             if let Some(b) = self.bars.get_mut(dev) {
                 b.scale = mw.geometry.scale_factor;
-                b.redraw(&mw.workspaces, &self.cfg, &self.renderer);
+                b.redraw(&mw.workspaces, &self.cfg, &self.renderer, self.dark);
             }
         }
     }
@@ -122,6 +127,43 @@ impl App {
         self.bars.clear();
         self.sync_bars();
     }
+
+    /// A system setting changed — re-check the light/dark theme and repaint
+    /// if it flipped. One registry read; no polling.
+    fn on_setting_change(&mut self) {
+        let dark = theme::is_dark();
+        if dark != self.dark {
+            self.dark = dark;
+            tracing::info!(
+                "Windows theme changed to {}; repainting.",
+                if dark { "dark" } else { "light" }
+            );
+            self.sync_bars();
+        }
+    }
+}
+
+/// Map a click on a bar window to its workspace and ask GlazeWM to focus it.
+///
+/// Called from the bar wndproc (same thread). Uses a shared borrow — clicks
+/// never mutate state directly; the focus change comes back as a GlazeWM
+/// event and redraws through the normal path.
+pub fn handle_bar_click(hwnd: HWND, x: i32) {
+    APP.with(|cell| {
+        let Ok(guard) = cell.try_borrow() else {
+            return;
+        };
+        let Some(app) = guard.as_ref() else {
+            return;
+        };
+        let Some(bar) = app.bars.values().find(|b| b.hwnd() == hwnd) else {
+            return;
+        };
+        if let Some(name) = bar.workspace_at(x as f32) {
+            tracing::debug!("Pill clicked; focusing workspace {name}.");
+            let _ = app.cmd_tx.send(format!("focus --workspace {name}"));
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -172,6 +214,11 @@ unsafe extern "system" fn msg_wndproc(
 ) -> LRESULT {
     if msg == WM_APP_STATE_CHANGED {
         dispatch_app(hwnd, msg, App::sync_bars);
+        return 0;
+    }
+
+    if msg == WM_SETTINGCHANGE {
+        dispatch_app(hwnd, msg, App::on_setting_change);
         return 0;
     }
 
@@ -231,7 +278,7 @@ fn main() -> Result<()> {
         Ordering::Relaxed,
     );
 
-    let state_rx = client::spawn(cfg.glazewm_port, cfg.reconnect_delay_ms);
+    let (state_rx, cmd_tx) = client::spawn(cfg.glazewm_port, cfg.reconnect_delay_ms);
     spawn_state_watcher(state_rx.clone(), msg_hwnd);
 
     let tray = match Tray::new(cfg.trayicon_hidden) {
@@ -246,12 +293,17 @@ fn main() -> Result<()> {
         }
     };
 
+    let dark = theme::is_dark();
+    tracing::debug!("Windows system theme: {}.", if dark { "dark" } else { "light" });
+
     APP.with(|cell| {
         *cell.borrow_mut() = Some(App {
             cfg,
             renderer: Renderer::new(),
             state_rx,
+            cmd_tx,
             bars: HashMap::new(),
+            dark,
         });
     });
 

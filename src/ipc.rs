@@ -36,15 +36,17 @@ pub struct ClientResponseMessage {
 
 /// Typed payload of a client response.
 ///
-/// Only the variants actually needed by glazeid are listed. Unknown variants
-/// are ignored via the `#[serde(other)]` fallback.
+/// Only the variants actually needed by glazeid are listed.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum ClientResponseData {
     Monitors(MonitorsData),
     EventSubscribe(EventSubscribeData),
-    /// Catch-all for query types we don't consume.
-    Other(()),
+    /// Catch-all for responses we don't consume (e.g. command responses,
+    /// which carry payloads like `{"subjectContainerId": ...}`). Must accept
+    /// arbitrary JSON — a unit variant would only match `null` and make the
+    /// whole `ServerMessage` fail to parse.
+    Other(serde_json::Value),
 }
 
 /// Payload of a `query monitors` response.

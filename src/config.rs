@@ -37,6 +37,55 @@ impl Color {
     }
 }
 
+/// A color that can differ between the Windows light and dark themes.
+///
+/// Accepts either a single value used for both themes:
+///
+/// ```yaml
+/// foreground: "#ffffff"
+/// ```
+///
+/// or per-theme values, switched live when the Windows system theme changes:
+///
+/// ```yaml
+/// foreground:
+///   light: "#000000"
+///   dark: "#ffffff"
+/// ```
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ThemedColor {
+    Single(Color),
+    Themed { light: Color, dark: Color },
+}
+
+impl ThemedColor {
+    /// Pick the color for the current theme.
+    pub fn resolve(&self, dark_theme: bool) -> &Color {
+        match self {
+            Self::Single(c) => c,
+            Self::Themed { light, dark } => {
+                if dark_theme {
+                    dark
+                } else {
+                    light
+                }
+            }
+        }
+    }
+
+    fn single(hex: &str) -> Self {
+        Self::Single(Color(hex.into()))
+    }
+
+    fn themed(light: &str, dark: &str) -> Self {
+        Self::Themed {
+            light: Color(light.into()),
+            dark: Color(dark.into()),
+        }
+    }
+}
+
 /// Top-level config file schema.
 ///
 /// Loaded from `%USERPROFILE%\.glzr\glazeid\config.yaml`, with sane defaults
@@ -61,16 +110,16 @@ pub struct Config {
 
     /// Background color of the widget. The default is fully transparent, so
     /// only the workspace pills are visible on the taskbar.
-    pub background: Color,
+    pub background: ThemedColor,
 
     /// Text color for inactive workspaces.
-    pub foreground: Color,
+    pub foreground: ThemedColor,
 
     /// Background color of the active workspace pill.
-    pub active_bg: Color,
+    pub active_bg: ThemedColor,
 
     /// Text color of the active workspace pill.
-    pub active_fg: Color,
+    pub active_fg: ThemedColor,
 
     /// Font size in logical pixels.
     pub font_size: f32,
@@ -96,10 +145,10 @@ impl Default for Config {
             offset_percent: 0.0,
             glazewm_port: 6123,
             reconnect_delay_ms: 2000,
-            background: Color("#00000000".into()),
-            foreground: Color("#ffffff".into()),
-            active_bg: Color("#DA3B01".into()),
-            active_fg: Color("#000000".into()),
+            background: ThemedColor::single("#00000000"),
+            foreground: ThemedColor::themed("#000000", "#ffffff"),
+            active_bg: ThemedColor::single("#DA3B01"),
+            active_fg: ThemedColor::themed("#ffffff", "#000000"),
             font_size: 13.0,
             label_padding_x: 10.0,
             label_padding_y: 4.0,

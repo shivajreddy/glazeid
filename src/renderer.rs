@@ -103,11 +103,44 @@ impl Renderer {
         }
     }
 
+    /// Compute the horizontal pixel range `(x_start, x_end)` of every
+    /// workspace pill, in the same physical-pixel space [`Renderer::render`]
+    /// draws in. Used for click hit-testing.
+    pub fn pill_ranges(
+        &self,
+        workspaces: &[WorkspaceInfo],
+        cfg: &Config,
+        scale: f32,
+    ) -> Vec<(f32, f32)> {
+        let font_px = cfg.font_size * scale;
+        let pad_x = cfg.label_padding_x * scale;
+
+        let mut cursor_x = pad_x / 2.0;
+        workspaces
+            .iter()
+            .map(|ws| {
+                let text_w: f32 = ws
+                    .label
+                    .chars()
+                    .map(|ch| {
+                        let (m, _) = self.font.rasterize(ch, font_px);
+                        m.advance_width
+                    })
+                    .sum();
+                let pill_w = text_w + pad_x * 2.0;
+                let range = (cursor_x, cursor_x + pill_w);
+                cursor_x += pill_w;
+                range
+            })
+            .collect()
+    }
+
     /// Render the bar into `buffer` (premultiplied BGRA u32 pixels, row-major).
     ///
     /// `width` and `height` must match the buffer dimensions exactly (they
     /// should come from a prior [`Renderer::measure`] call scaled to physical
     /// pixels).  `scale` converts logical config values to physical pixels.
+    /// `dark` selects the light/dark variant of themed colors.
     pub fn render(
         &self,
         buffer: &mut [u32],
@@ -116,6 +149,7 @@ impl Renderer {
         scale: f32,
         workspaces: &[WorkspaceInfo],
         cfg: &Config,
+        dark: bool,
     ) {
         if width == 0 || height == 0 {
             return;
@@ -126,7 +160,7 @@ impl Renderer {
 
         // Clear to background. `fill` overwrites every pixel, so a reused
         // buffer (the DIB section persists across frames) starts clean.
-        pixmap.fill(cfg.background.to_skia());
+        pixmap.fill(cfg.background.resolve(dark).to_skia());
 
         let font_px = cfg.font_size * scale;
         let pad_x = cfg.label_padding_x * scale;
@@ -158,7 +192,21 @@ impl Renderer {
                     pill_w,
                     pill_h,
                     radius,
-                    cfg.active_bg.to_skia(),
+                    cfg.active_bg.resolve(dark).to_skia(),
+                );
+            } else {
+                // Nearly invisible fill (alpha 1/255): layered windows pass
+                // clicks through wherever alpha is exactly 0, so this makes
+                // the whole pill area clickable — not just the glyph pixels —
+                // without any visible difference.
+                draw_rounded_rect(
+                    &mut pixmap,
+                    cursor_x,
+                    pill_y,
+                    pill_w,
+                    pill_h,
+                    radius,
+                    Color::from_rgba8(0, 0, 0, 1),
                 );
             }
 
@@ -177,9 +225,9 @@ impl Renderer {
             let text_y = (height as f32 - cap_h) / 2.0;
 
             let fg = if ws.has_focus {
-                cfg.active_fg.to_skia()
+                cfg.active_fg.resolve(dark).to_skia()
             } else {
-                cfg.foreground.to_skia()
+                cfg.foreground.resolve(dark).to_skia()
             };
 
             draw_text(

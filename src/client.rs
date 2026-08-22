@@ -4,12 +4,16 @@
 /// workspace state, then subscribes to workspace-related events, pushing
 /// `BarState` updates through a `tokio::sync::watch` channel so the render
 /// loop always sees the latest state without blocking.
+///
+/// Commands (e.g. `focus --workspace 3` from a pill click) are fed in
+/// through an unbounded mpsc channel and sent over the same WebSocket
+/// connection.
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::{
     connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream,
 };
@@ -21,7 +25,7 @@ use crate::ipc::{
 // Public state type
 // ---------------------------------------------------------------------------
 
-/// Monitor geometry as reported by GlazeWM (logical pixels).
+/// Monitor geometry as reported by GlazeWM (physical pixels on Windows).
 #[derive(Clone, Debug, Default)]
 pub struct MonitorGeometry {
     pub x: i32,
@@ -36,8 +40,7 @@ pub struct MonitorGeometry {
 pub struct MonitorWorkspaces {
     /// Workspaces on this monitor, in the order returned by GlazeWM.
     pub workspaces: Vec<WorkspaceInfo>,
-    /// Monitor geometry from GlazeWM (logical pixels, same coordinate space
-    /// GlazeWM uses — reliable across Windows and macOS).
+    /// Monitor geometry from GlazeWM (same coordinate space GlazeWM uses).
     pub geometry: MonitorGeometry,
 }
 
@@ -45,7 +48,9 @@ pub struct MonitorWorkspaces {
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct WorkspaceInfo {
-    /// Numeric or named label shown on the bar.
+    /// GlazeWM workspace name — used in `focus --workspace <name>` commands.
+    pub name: String,
+    /// Label shown on the bar (`display_name`, falling back to `name`).
     pub label: String,
     /// Whether this workspace is currently focused (has keyboard focus).
     pub has_focus: bool,
@@ -93,6 +98,7 @@ impl BarState {
 
 fn workspace_info(ws: &WorkspaceDto) -> WorkspaceInfo {
     WorkspaceInfo {
+        name: ws.name.clone(),
         label: ws
             .display_name
             .clone()
@@ -173,24 +179,28 @@ impl IpcConn {
 
 /// Spawn the IPC background task.
 ///
-/// Returns a `watch::Receiver<BarState>` that always holds the latest workspace
-/// state. The task reconnects automatically on connection loss.
+/// Returns a `watch::Receiver<BarState>` that always holds the latest
+/// workspace state, and a sender for WM commands (e.g.
+/// `focus --workspace 3`). The task reconnects automatically on connection
+/// loss.
 pub fn spawn(
     port: u16,
     reconnect_delay_ms: u64,
-) -> watch::Receiver<BarState> {
+) -> (watch::Receiver<BarState>, mpsc::UnboundedSender<String>) {
     let (tx, rx) = watch::channel(BarState::default());
-    tokio::spawn(ipc_loop(port, reconnect_delay_ms, tx));
-    rx
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    tokio::spawn(ipc_loop(port, reconnect_delay_ms, tx, cmd_rx));
+    (rx, cmd_tx)
 }
 
 async fn ipc_loop(
     port: u16,
     reconnect_delay_ms: u64,
     tx: watch::Sender<BarState>,
+    mut cmd_rx: mpsc::UnboundedReceiver<String>,
 ) {
     loop {
-        match run_session(port, &tx).await {
+        match run_session(port, &tx, &mut cmd_rx).await {
             Ok(()) => {
                 // GlazeWM exited cleanly (ApplicationExiting event or stream closed).
                 tracing::info!("GlazeWM IPC session ended; reconnecting in {reconnect_delay_ms}ms.");
@@ -207,9 +217,14 @@ async fn ipc_loop(
 async fn run_session(
     port: u16,
     tx: &watch::Sender<BarState>,
+    cmd_rx: &mut mpsc::UnboundedReceiver<String>,
 ) -> Result<()> {
     let mut conn = IpcConn::connect(port).await?;
     tracing::info!("Connected to GlazeWM IPC on port {port}.");
+
+    // Drop commands queued while disconnected — a click from before a
+    // reconnect should not fire minutes later.
+    while cmd_rx.try_recv().is_ok() {}
 
     // 1. Fetch initial state.
     let state = fetch_state(&mut conn).await?;
@@ -234,41 +249,60 @@ async fn run_session(
     };
     tracing::debug!(sub_id = %sub_id, "Subscribed to GlazeWM events.");
 
-    // 3. Event loop.
+    // 3. Event loop: wake on server messages *or* outgoing commands.
     loop {
-        let msg = conn.next().await?;
+        tokio::select! {
+            msg = conn.next() => {
+                let msg = msg?;
+                match msg {
+                    ServerMessage::EventSubscription(ev)
+                        if ev.subscription_id == sub_id =>
+                    {
+                        let needs_refetch = match &ev.data {
+                            Some(WmEvent::WorkspaceActivated { .. })
+                            | Some(WmEvent::WorkspaceDeactivated { .. })
+                            | Some(WmEvent::WorkspaceUpdated { .. })
+                            | Some(WmEvent::FocusChanged { .. })
+                            | Some(WmEvent::FocusedContainerMoved { .. })
+                            | Some(WmEvent::MonitorAdded { .. })
+                            | Some(WmEvent::MonitorRemoved { .. })
+                            | Some(WmEvent::MonitorUpdated { .. }) => true,
+                            Some(WmEvent::Other) | None => false,
+                        };
 
-        match msg {
-            ServerMessage::EventSubscription(ev)
-                if ev.subscription_id == sub_id =>
-            {
-                let needs_refetch = match &ev.data {
-                    Some(WmEvent::WorkspaceActivated { .. })
-                    | Some(WmEvent::WorkspaceDeactivated { .. })
-                    | Some(WmEvent::WorkspaceUpdated { .. })
-                    | Some(WmEvent::FocusChanged { .. })
-                    | Some(WmEvent::FocusedContainerMoved { .. })
-                    | Some(WmEvent::MonitorAdded { .. })
-                    | Some(WmEvent::MonitorRemoved { .. })
-                    | Some(WmEvent::MonitorUpdated { .. }) => true,
-                    Some(WmEvent::Other) | None => false,
-                };
-
-                if needs_refetch {
-                    // Re-fetch full monitor tree to keep state coherent.
-                    match fetch_state(&mut conn).await {
-                        Ok(state) => {
-                            let _ = tx.send(state);
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to re-fetch state: {e:#}");
-                            return Err(e);
+                        if needs_refetch {
+                            // Re-fetch full monitor tree to keep state coherent.
+                            match fetch_state(&mut conn).await {
+                                Ok(state) => {
+                                    let _ = tx.send(state);
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Failed to re-fetch state: {e:#}");
+                                    return Err(e);
+                                }
+                            }
                         }
                     }
+                    // Surface failed command responses (e.g. bad workspace name).
+                    ServerMessage::ClientResponse(r) if !r.success => {
+                        tracing::warn!(
+                            "GlazeWM rejected \"{}\": {:?}",
+                            r.client_message,
+                            r.error
+                        );
+                    }
+                    // Ignore everything else (e.g. successful command responses).
+                    _ => {}
                 }
             }
-            // Ignore unrelated messages (e.g. responses from other commands).
-            _ => {}
+            cmd = cmd_rx.recv() => {
+                let Some(cmd) = cmd else {
+                    // All senders dropped — shutting down.
+                    return Ok(());
+                };
+                tracing::debug!("Sending WM command: {cmd}");
+                conn.send(&format!("command {cmd}")).await?;
+            }
         }
     }
 }

@@ -19,18 +19,29 @@ glazewm_port: 6123
 # Milliseconds to wait before retrying a failed IPC connection.
 reconnect_delay_ms: 2000
 
-# Widget background color. Use "#rrggbbaa" for transparency.
-# The default is fully transparent, so only the workspace pills are visible.
+# --- Colors -----------------------------------------------------------------
+# Colors accept either a single value used for both Windows themes:
+#   foreground: "#ffffff"
+# or per-theme values, switched live with the Windows system (taskbar) theme:
+#   foreground: { light: "#000000", dark: "#ffffff" }
+# Values are "#rrggbb" or "#rrggbbaa" (with alpha).
+
+# Widget background color.
+# Default is fully transparent, so only the workspace pills are visible.
 background: "#00000000"
 
 # Text color for inactive workspace labels.
-foreground: "#ffffff"
+foreground:
+  light: "#000000"
+  dark: "#ffffff"
 
 # Fill color of the active workspace pill.
 active_bg: "#DA3B01"
 
 # Text color on the active workspace pill.
-active_fg: "#000000"
+active_fg:
+  light: "#ffffff"
+  dark: "#000000"
 
 # Font size in logical pixels.
 font_size: 13.0

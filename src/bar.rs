@@ -9,13 +9,16 @@
 /// us: the bar moves with the taskbar, disappears with it under fullscreen
 /// apps, follows auto-hide, and needs no polling at all.
 ///
-/// # Rendering
+/// # Rendering and input
 ///
 /// tiny_skia draws into a 32-bpp premultiplied-BGRA DIB section, which is
 /// pushed to the window with `UpdateLayeredWindow` (per-pixel alpha;
-/// supported for child windows since Windows 8). Pixels with alpha 0 are
-/// hit-test transparent, and `WS_EX_TRANSPARENT` makes the rest
-/// click-through too, so the bar never eats taskbar input.
+/// supported for child windows since Windows 8). Layered-window hit testing
+/// is alpha-based: pixels with alpha 0 pass clicks through to the taskbar,
+/// while pill pixels (the renderer gives inactive pills an invisible
+/// alpha-1 fill) receive them — a click on a pill focuses that workspace.
+/// The window never activates (`WS_EX_NOACTIVATE` + `MA_NOACTIVATE`), so
+/// clicks never steal keyboard focus.
 use std::sync::Once;
 
 use anyhow::{anyhow, Result};
@@ -29,10 +32,10 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, IsWindow, RegisterClassW,
-    SetParent, SetWindowPos, UpdateLayeredWindow, GWL_STYLE, HWND_TOP, SWP_NOACTIVATE,
-    SWP_SHOWWINDOW, ULW_ALPHA, WNDCLASSW, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, IsWindow, LoadCursorW,
+    RegisterClassW, SetParent, SetWindowPos, UpdateLayeredWindow, GWL_STYLE, HWND_TOP, IDC_HAND,
+    MA_NOACTIVATE, SWP_NOACTIVATE, SWP_SHOWWINDOW, ULW_ALPHA, WM_LBUTTONUP, WM_MOUSEACTIVATE,
+    WNDCLASSW, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 use crate::client::WorkspaceInfo;
@@ -152,6 +155,9 @@ pub struct BarWindow {
     /// DPI scale of the monitor, from GlazeWM.
     pub scale: f32,
     dib: Option<Dib>,
+    /// Pill hit ranges from the last render: `(x_start, x_end, workspace
+    /// name)` in client physical pixels. Used to map clicks to workspaces.
+    hits: Vec<(f32, f32, String)>,
 }
 
 impl BarWindow {
@@ -165,8 +171,10 @@ impl BarWindow {
 
             // Created as an invisible popup first; SetParent's contract wants
             // the WS_POPUP → WS_CHILD style switch done before re-parenting.
+            // No WS_EX_TRANSPARENT: pills must receive clicks (alpha-0 areas
+            // are click-through anyway via layered-window hit testing).
             let hwnd = CreateWindowExW(
-                WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
                 class.as_ptr(),
                 title.as_ptr(),
                 WS_POPUP,
@@ -200,6 +208,7 @@ impl BarWindow {
                 taskbar_hwnd: taskbar.hwnd,
                 scale,
                 dib: None,
+                hits: Vec::new(),
             })
         }
     }
@@ -209,8 +218,26 @@ impl BarWindow {
         unsafe { IsWindow(self.hwnd) != 0 && IsWindow(self.taskbar_hwnd) != 0 }
     }
 
+    pub fn hwnd(&self) -> HWND {
+        self.hwnd
+    }
+
+    /// The workspace name under client-x coordinate `x`, if any.
+    pub fn workspace_at(&self, x: f32) -> Option<&str> {
+        self.hits
+            .iter()
+            .find(|(x0, x1, _)| x >= *x0 && x < *x1)
+            .map(|(_, _, name)| name.as_str())
+    }
+
     /// Re-render and re-position the bar inside its taskbar.
-    pub fn redraw(&mut self, workspaces: &[WorkspaceInfo], cfg: &Config, renderer: &Renderer) {
+    pub fn redraw(
+        &mut self,
+        workspaces: &[WorkspaceInfo],
+        cfg: &Config,
+        renderer: &Renderer,
+        dark: bool,
+    ) {
         let content = renderer.measure(workspaces, cfg, self.scale);
         let (w, h) = (content.width.max(1), content.height.max(1));
 
@@ -226,7 +253,15 @@ impl BarWindow {
         }
         let dib = self.dib.as_mut().unwrap();
 
-        renderer.render(dib.pixels_mut(), w, h, self.scale, workspaces, cfg);
+        renderer.render(dib.pixels_mut(), w, h, self.scale, workspaces, cfg, dark);
+
+        // Refresh the click hit map to match what was just drawn.
+        self.hits = renderer
+            .pill_ranges(workspaces, cfg, self.scale)
+            .into_iter()
+            .zip(workspaces)
+            .map(|((x0, x1), ws)| (x0, x1, ws.name.clone()))
+            .collect();
 
         unsafe {
             // Position inside the taskbar's client area: `offset_percent`
@@ -303,6 +338,8 @@ unsafe fn ensure_class() {
         wc.lpfnWndProc = Some(bar_wndproc);
         wc.hInstance = GetModuleHandleW(std::ptr::null());
         wc.lpszClassName = class.as_ptr();
+        // Hand cursor over the pills — they are clickable.
+        wc.hCursor = LoadCursorW(std::ptr::null_mut(), IDC_HAND);
         if RegisterClassW(&wc) == 0 {
             tracing::warn!(
                 "RegisterClassW({BAR_CLASS}) failed (error {}).",
@@ -312,13 +349,23 @@ unsafe fn ensure_class() {
     });
 }
 
-/// The bar never handles input (`WS_EX_TRANSPARENT`) and paints exclusively
-/// via `UpdateLayeredWindow`, so default handling suffices.
+/// Painting happens exclusively via `UpdateLayeredWindow`; the only messages
+/// of interest are clicks (focus the clicked workspace) and activation
+/// (suppressed so the bar never steals keyboard focus).
 unsafe extern "system" fn bar_wndproc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    DefWindowProcW(hwnd, msg, wparam, lparam)
+    match msg {
+        WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
+        WM_LBUTTONUP => {
+            // Client-area x coordinate (low word, signed).
+            let x = (lparam as u32 & 0xFFFF) as u16 as i16 as i32;
+            crate::handle_bar_click(hwnd, x);
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
 }

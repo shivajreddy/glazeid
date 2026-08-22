@@ -12,7 +12,9 @@
 
 - Renders *inside* the native taskbar — one widget per monitor's taskbar
 - Active workspace highlighted with a filled pill
-- Per-pixel alpha over the taskbar; fully click-through
+- Click a pill to focus that workspace
+- Per-pixel alpha over the taskbar; transparent areas stay click-through
+- Colors can follow the Windows light/dark theme, switched live
 - Connects to GlazeWM over WebSocket and reacts to workspace events in real time
 - Reconnects automatically if GlazeWM restarts; re-embeds automatically if Explorer restarts
 - No polling: fullscreen apps, auto-hide and z-order are handled by the shell itself
@@ -93,18 +95,27 @@ glazewm_port: 6123
 # Milliseconds to wait before retrying a failed IPC connection.
 reconnect_delay_ms: 2000
 
+# Colors accept either a single value used for both Windows themes:
+#   foreground: "#ffffff"
+# or per-theme values, switched live with the Windows system (taskbar) theme:
+#   foreground: { light: "#000000", dark: "#ffffff" }
+
 # Widget background color. Use "#rrggbbaa" for transparency.
 # The default is fully transparent, so only the workspace pills are visible.
 background: "#00000000"
 
 # Text color for inactive workspace labels.
-foreground: "#ffffff"
+foreground:
+  light: "#000000"
+  dark: "#ffffff"
 
 # Fill color of the active workspace pill.
 active_bg: "#DA3B01"
 
 # Text color on the active workspace pill.
-active_fg: "#000000"
+active_fg:
+  light: "#ffffff"
+  dark: "#000000"
 
 # Font size in logical pixels.
 font_size: 13.0
@@ -124,7 +135,9 @@ pill_radius: 4.0
 trayicon_hidden: false
 ```
 
-Colors are hex strings: `"#rrggbb"` (fully opaque) or `"#rrggbbaa"` (with alpha).
+Colors are hex strings: `"#rrggbb"` (fully opaque) or `"#rrggbbaa"` (with
+alpha). The light/dark switch follows the Windows *system* theme (the one the
+taskbar uses) and reacts immediately when it changes — no restart needed.
 
 ## How it works
 
@@ -141,9 +154,13 @@ Colors are hex strings: `"#rrggbb"` (fully opaque) or `"#rrggbbaa"` (with alpha)
 Because the widget is a child window of the taskbar itself, the shell handles
 everything the old overlay implementation (v0.7.x) had to fight for by hand:
 no topmost z-order battles, no fullscreen detection, no 1-second polling tick.
-When the taskbar hides, moves or dies, the widget follows it. Pixels with
-alpha 0 are hit-test transparent and the rest is `WS_EX_TRANSPARENT`, so the
-widget never intercepts taskbar input.
+When the taskbar hides, moves or dies, the widget follows it.
+
+Input is alpha-based: pixels with alpha 0 pass clicks straight through to the
+taskbar, while pill pixels receive them — a click sends
+`focus --workspace <name>` over the existing WebSocket connection. The widget
+never activates, so clicks never steal keyboard focus. Theme changes arrive
+via the `WM_SETTINGCHANGE` broadcast (one registry read, no polling).
 
 ## License
 
